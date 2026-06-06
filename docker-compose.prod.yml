@@ -1,0 +1,65 @@
+name: schengen-platform
+
+services:
+  # ─── Redis (BullMQ queue) — runs locally on the instance ──────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: schengen-redis
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # No ports exposed to host — only reachable by other containers
+
+  # ─── NestJS Backend API ───────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: schengen-backend
+    restart: unless-stopped
+    env_file:
+      - ./backend/.env
+    environment:
+      - NODE_ENV=production
+      # Override Upstash with the local Redis container (drops Upstash dependency)
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    # No ports exposed to host — Nginx talks to it internally on :3001
+
+  # ─── Next.js Frontend ─────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # Frontend calls the API through Nginx at /api (relative path),
+        # so it works on ANY IP/domain without rebuilding.
+        - NEXT_PUBLIC_API_URL=/api
+    container_name: schengen-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    # No ports exposed to host — Nginx talks to it internally on :3000
+
+  # ─── Nginx reverse proxy — the ONLY thing exposed to the internet ─────────
+  nginx:
+    image: nginx:alpine
+    container_name: schengen-nginx
+    restart: unless-stopped
+    ports:
+      - '80:80'
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - backend
+      - frontend
+
+volumes:
+  redis_data:

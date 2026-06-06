@@ -1,0 +1,610 @@
+import { Injectable, Logger, Inject } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { InjectQueue } from '@nestjs/bull';
+import { Queue } from 'bull';
+import { SupabaseClient } from '@supabase/supabase-js';
+import axios from 'axios';
+import { SUPABASE_CLIENT } from '../../database/database.module';
+import { ExtractionService, ExtractedVisaData } from '../extraction/extraction.service';
+import { hashContent } from '../../common/utils/hash.util';
+import {
+  CRAWL_QUEUE_NAME,
+  CrawlJobData,
+  CrawlJobPriority,
+} from './crawler.queue';
+import {
+  SCHENGEN_STANDARD_REQUIREMENTS,
+  SCHENGEN_STANDARD_DOCUMENTS,
+  isSchengenCountry,
+} from './schengen-standard-data';
+
+// ─── ISO alpha-2 → ISO alpha-3 lowercase (VFS URL format) ────────────────────
+// VFS URL pattern: https://visa.vfsglobal.com/{origin3}/en/{dest3}/
+const ISO2_TO_ISO3: Record<string, string> = {
+  AF:'afg', AL:'alb', DZ:'dza', AD:'and', AO:'ago', AG:'atg', AR:'arg', AM:'arm',
+  AU:'aus', AT:'aut', AZ:'aze', BS:'bhs', BH:'bhr', BD:'bgd', BB:'brb', BY:'blr',
+  BE:'bel', BZ:'blz', BJ:'ben', BT:'btn', BO:'bol', BA:'bih', BW:'bwa', BR:'bra',
+  BN:'brn', BG:'bgr', BF:'bfa', BI:'bdi', CV:'cpv', KH:'khm', CM:'cmr', CA:'can',
+  CF:'caf', TD:'tcd', CL:'chl', CN:'chn', CO:'col', KM:'com', CG:'cog', CD:'cod',
+  CR:'cri', CI:'civ', HR:'hrv', CU:'cub', CY:'cyp', CZ:'cze', DK:'dnk', DJ:'dji',
+  DM:'dma', DO:'dom', EC:'ecu', EG:'egy', SV:'slv', GQ:'gnq', ER:'eri', EE:'est',
+  SZ:'swz', ET:'eth', FJ:'fji', FI:'fin', FR:'fra', GA:'gab', GM:'gmb', GE:'geo',
+  DE:'deu', GH:'gha', GR:'grc', GD:'grd', GT:'gtm', GN:'gin', GW:'gnb', GY:'guy',
+  HT:'hti', HN:'hnd', HU:'hun', IS:'isl', IN:'ind', ID:'idn', IR:'irn', IQ:'irq',
+  IE:'irl', IL:'isr', IT:'ita', JM:'jam', JP:'jpn', JO:'jor', KZ:'kaz', KE:'ken',
+  KI:'kir', KW:'kwt', KG:'kgz', LA:'lao', LV:'lva', LB:'lbn', LS:'lso', LR:'lbr',
+  LY:'lby', LI:'lie', LT:'ltu', LU:'lux', MG:'mdg', MW:'mwi', MY:'mys', MV:'mdv',
+  ML:'mli', MT:'mlt', MH:'mhl', MR:'mrt', MU:'mus', MX:'mex', FM:'fsm', MD:'mda',
+  MC:'mco', MN:'mng', ME:'mne', MA:'mar', MZ:'moz', MM:'mmr', NA:'nam', NR:'nru',
+  NP:'npl', NL:'nld', NZ:'nzl', NI:'nic', NE:'ner', NG:'nga', MK:'mkd', NO:'nor',
+  OM:'omn', PK:'pak', PW:'plw', PA:'pan', PG:'png', PY:'pry', PE:'per', PH:'phl',
+  PL:'pol', PT:'prt', QA:'qat', RO:'rou', RU:'rus', RW:'rwa', KN:'kna', LC:'lca',
+  VC:'vct', WS:'wsm', SM:'smr', ST:'stp', SA:'sau', SN:'sen', RS:'srb', SC:'syc',
+  SL:'sle', SG:'sgp', SK:'svk', SI:'svn', SB:'slb', SO:'som', ZA:'zaf', SS:'ssd',
+  ES:'esp', LK:'lka', SD:'sdn', SR:'sur', SE:'swe', CH:'che', SY:'syr', TW:'twn',
+  TJ:'tjk', TZ:'tza', TH:'tha', TL:'tls', TG:'tgo', TO:'ton', TT:'tto', TN:'tun',
+  TR:'tur', TM:'tkm', TV:'tuv', UG:'uga', UA:'ukr', AE:'are', GB:'gbr', US:'usa',
+  UY:'ury', UZ:'uzb', VU:'vut', VE:'ven', VN:'vnm', YE:'yem', ZM:'zmb', ZW:'zwe',
+  PS:'pse', XK:'xkx',
+};
+
+// Schengen country full names for aggregator URL construction
+const SCHENGEN_COUNTRY_NAMES: Record<string, string> = {
+  AT:'austria', BE:'belgium', HR:'croatia', CZ:'czechia', DK:'denmark',
+  EE:'estonia', FI:'finland', FR:'france', DE:'germany', GR:'greece',
+  HU:'hungary', IS:'iceland', IT:'italy', LV:'latvia', LI:'liechtenstein',
+  LT:'lithuania', LU:'luxembourg', MT:'malta', NL:'netherlands', NO:'norway',
+  PL:'poland', PT:'portugal', SK:'slovakia', SI:'slovenia', ES:'spain',
+  SE:'sweden', CH:'switzerland',
+};
+
+// Country-specific VFS eVisa portal URLs for non-Schengen destinations
+const VFS_EVISA_PORTALS: Record<string, string[]> = {
+  BR: [
+    'https://brazil.vfsevisa.com/checklist',
+    'https://brazil.vfsevisa.com/',
+  ],
+  IN: ['https://indianvisaonline.gov.in/evisa/tvoa.html'],
+  AU: ['https://immi.homeaffairs.gov.au/visas/getting-a-visa/visa-listing/visitor-600'],
+  US: ['https://travel.state.gov/content/travel/en/us-visas/tourism-visit/visitor.html'],
+  GB: ['https://www.gov.uk/standard-visitor'],
+  CA: ['https://www.canada.ca/en/immigration-refugees-citizenship/services/visit-canada.html'],
+  NZ: ['https://www.immigration.govt.nz/new-zealand-visas/apply-for-a-visa/about-visa/visitor-visa'],
+};
+
+@Injectable()
+export class CrawlerService {
+  private readonly logger = new Logger(CrawlerService.name);
+  private readonly firecrawlBaseUrl = 'https://api.firecrawl.dev/v1';
+
+  // Tracks routes with a crawl currently in flight, to avoid duplicate crawls
+  // when the frontend polls repeatedly while waiting for data.
+  private readonly inFlightCrawls = new Set<string>();
+
+  constructor(
+    @Inject(SUPABASE_CLIENT) private readonly supabase: SupabaseClient,
+    private readonly configService: ConfigService,
+    private readonly extractionService: ExtractionService,
+    @InjectQueue(CRAWL_QUEUE_NAME) private readonly crawlQueue: Queue,
+  ) {}
+
+  /** True if a crawl for this route is already running. */
+  isCrawlInFlight(origin: string, destination: string): boolean {
+    return this.inFlightCrawls.has(`${origin.toUpperCase()}-${destination.toUpperCase()}`);
+  }
+
+  // ─── Queue Management ────────────────────────────────────────────────────────
+
+  /**
+   * Returns jobId immediately — never blocks the HTTP response.
+   * Enqueues via Redis; falls back to direct crawl if Redis is down.
+   */
+  enqueueHighPriority(origin: string, destination: string): string {
+    const orig = origin.toUpperCase();
+    const dest = destination.toUpperCase();
+    const jobId = `job-${Date.now()}`;
+    const key = `${orig}-${dest}`;
+
+    // Already crawling this route — don't start a duplicate
+    if (this.inFlightCrawls.has(key)) {
+      this.logger.log(`Crawl already in flight for ${orig}->${dest} — skipping duplicate`);
+      return jobId;
+    }
+    this.inFlightCrawls.add(key);
+
+    // Safety: release the lock after 3 minutes even if the crawl never completes,
+    // so the route isn't stuck "pending" forever.
+    setTimeout(() => this.inFlightCrawls.delete(key), 180000);
+
+    setImmediate(async () => {
+      try {
+        await this.crawlQueue.add(
+          'crawl',
+          { origin: orig, destination: dest, priority: CrawlJobPriority.HIGH } as CrawlJobData,
+          { priority: CrawlJobPriority.HIGH, attempts: 3, backoff: { type: 'exponential', delay: 5000 } },
+        );
+        this.logger.log(`Queued HIGH priority crawl for ${orig}->${dest} (jobId: ${jobId})`);
+      } catch (err) {
+        this.logger.warn(`Redis unavailable — running crawl directly for ${orig}->${dest}`);
+        // crawlRoute clears the in-flight lock in its finally block
+        this.crawlRoute(orig, dest)
+          .catch(e => this.logger.error(`Direct crawl failed for ${orig}->${dest}: ${e.message}`));
+      }
+    });
+
+    return jobId;
+  }
+
+  enqueueLowPriority(origin: string, destination: string, routeId?: string): void {
+    const orig = origin.toUpperCase();
+    const dest = destination.toUpperCase();
+
+    setImmediate(async () => {
+      try {
+        await this.crawlQueue.add(
+          'crawl',
+          { origin: orig, destination: dest, routeId, priority: CrawlJobPriority.LOW } as CrawlJobData,
+          { priority: CrawlJobPriority.LOW, attempts: 2, backoff: { type: 'fixed', delay: 30000 } },
+        );
+      } catch {
+        this.logger.warn(`Redis unavailable — skipping low-priority refresh for ${orig}->${dest}`);
+      }
+    });
+  }
+
+  // ─── Core Crawl Orchestrator ─────────────────────────────────────────────────
+
+  async crawlRoute(origin: string, destination: string, routeId?: string): Promise<void> {
+    const apiKey = this.configService.getOrThrow<string>('FIRECRAWL_API_KEY');
+    const orig = origin.toUpperCase();
+    const dest = destination.toUpperCase();
+    const key = `${orig}-${dest}`;
+
+    try {
+      // ── STEP 1: For Schengen routes, seed the standard knowledge base FIRST ──
+      // This guarantees the route resolves quickly with accurate, complete data
+      // (fees, documents, insurance) regardless of whether the live crawl succeeds.
+      if (isSchengenCountry(dest)) {
+        const resolvedRouteId = routeId ?? (await this.resolveRouteId(orig, dest));
+        if (resolvedRouteId) {
+          await this.seedSchengenStandardData(resolvedRouteId, orig, dest);
+          this.logger.log(`Seeded standard Schengen data for ${orig}->${dest}`);
+        }
+      }
+
+      // ── STEP 2: Crawl live sources IN PARALLEL to enrich/confirm ──
+      const urls = this.buildCrawlUrls(orig, dest);
+      this.logger.log(`Starting parallel crawl for ${orig}->${dest} | ${urls.length} URLs`);
+
+      const results = await Promise.allSettled(
+        urls.map(({ url, type }) =>
+          this.crawlSingleUrl(url, type, orig, dest, routeId, apiKey),
+        ),
+      );
+
+      const successCount = results.filter(
+        (r) => r.status === 'fulfilled' && r.value === true,
+      ).length;
+
+      this.logger.log(
+        `Crawl complete for ${orig}->${dest}: ${successCount}/${urls.length} URLs succeeded`,
+      );
+    } finally {
+      // Always release the in-flight lock so future searches can re-crawl
+      this.inFlightCrawls.delete(key);
+    }
+  }
+
+  /**
+   * Seeds the standardized Schengen short-stay visa data (fees, insurance,
+   * processing time, and the full document checklist) for a route.
+   * Used as the reliable baseline since VFS Global's SPA does not expose
+   * this data in scrapable HTML.
+   */
+  private async seedSchengenStandardData(
+    routeId: string,
+    origin: string,
+    destination: string,
+  ): Promise<void> {
+    const now = new Date().toISOString();
+    const std = SCHENGEN_STANDARD_REQUIREMENTS;
+
+    // Only seed requirements if none exist yet (don't overwrite richer crawled data)
+    const { data: existingReq } = await this.supabase
+      .from('visa_requirements')
+      .select('id')
+      .eq('route_id', routeId)
+      .maybeSingle();
+
+    if (!existingReq) {
+      await this.supabase.from('visa_requirements').insert({
+        route_id: routeId,
+        visa_fee: std.visa_fee,
+        visa_fee_currency: std.visa_fee_currency,
+        service_fee: null,
+        processing_time_min: std.processing_time_min,
+        processing_time_max: std.processing_time_max,
+        insurance_required: std.insurance_required,
+        insurance_min_coverage: std.insurance_min_coverage,
+        vaccination_required: std.vaccination_required,
+        vaccination_notes: std.vaccination_notes,
+        min_passport_validity_days: std.min_passport_validity_days,
+        eligibility_notes: std.eligibility_notes,
+        last_verified_at: now,
+        data_freshness_status: 'fresh',
+        confidence_level: 'high',
+        updated_at: now,
+      });
+    }
+
+    // Seed standard document checklist if no documents exist yet
+    const { data: existingDocs } = await this.supabase
+      .from('visa_documents')
+      .select('id')
+      .eq('route_id', routeId)
+      .limit(1);
+
+    if (!existingDocs || existingDocs.length === 0) {
+      await this.supabase.from('visa_documents').insert(
+        SCHENGEN_STANDARD_DOCUMENTS.map((doc, idx) => ({
+          route_id: routeId,
+          document_name: doc.name,
+          is_mandatory: doc.mandatory,
+          notes: doc.notes,
+          display_order: idx,
+        })),
+      );
+    }
+
+    // Mark route active
+    await this.supabase
+      .from('visa_routes')
+      .update({
+        route_status: 'active',
+        application_center: 'VFS Global',
+        visa_category: 'Schengen Short Stay (Type C)',
+        updated_at: now,
+      })
+      .eq('id', routeId);
+  }
+
+  // ─── URL Strategy ────────────────────────────────────────────────────────────
+
+  /**
+   * Builds prioritised list of source URLs for a route.
+   *
+   * Priority order:
+   * 1. VFS Global per-country portal  (visa.vfsglobal.com/{origin3}/en/{dest3}/)
+   * 2. VFS required-documents sub-page
+   * 3. VFS prepare-application sub-page
+   * 4. Schengen visa info aggregator
+   * 5. Destination country official Schengen visa info page
+   */
+  private buildCrawlUrls(
+    origin: string,
+    destination: string,
+  ): Array<{ url: string; type: string }> {
+    const orig3 = ISO2_TO_ISO3[origin.toUpperCase()];
+    const dest3  = ISO2_TO_ISO3[destination.toUpperCase()];
+    const destUpper = destination.toUpperCase();
+    const destName = SCHENGEN_COUNTRY_NAMES[destUpper];
+    const isSchengen = !!destName;
+
+    const urls: Array<{ url: string; type: string }> = [];
+
+    if (isSchengen) {
+      // ── Schengen destination: use visa.vfsglobal.com portal ──
+      if (orig3 && dest3) {
+        const vfsBase = `https://visa.vfsglobal.com/${orig3}/en/${dest3}`;
+        urls.push({ url: `${vfsBase}/`,                                  type: 'vfs_main' });
+        urls.push({ url: `${vfsBase}/attend-centre/required-documents`,  type: 'vfs_docs' });
+        urls.push({ url: `${vfsBase}/attend-centre/prepare-application`, type: 'vfs_prep' });
+      }
+
+      // Schengen info aggregator
+      urls.push({
+        url: `https://www.schengenvisainfo.com/${destName}-visa/`,
+        type: 'aggregator',
+      });
+
+      // EU official Schengen page
+      urls.push({
+        url: 'https://home-affairs.ec.europa.eu/policies/schengen-borders-and-visa/visa-policy_en',
+        type: 'eu_official',
+      });
+    } else {
+      // ── Non-Schengen destination: use country-specific VFS eVisa portals ──
+      const evisaUrls = VFS_EVISA_PORTALS[destUpper] ?? [];
+      for (const u of evisaUrls) {
+        urls.push({ url: u, type: 'vfs_evisa' });
+      }
+
+      // Fallback: try the VFS global portal anyway (may have info for some routes)
+      if (orig3 && dest3 && evisaUrls.length === 0) {
+        const vfsBase = `https://visa.vfsglobal.com/${orig3}/en/${dest3}`;
+        urls.push({ url: `${vfsBase}/`, type: 'vfs_main' });
+      }
+    }
+
+    return urls;
+  }
+
+  // ─── Single URL Crawl ────────────────────────────────────────────────────────
+
+  private async crawlSingleUrl(
+    url: string,
+    sourceType: string,
+    origin: string,
+    destination: string,
+    routeId: string | undefined,
+    apiKey: string,
+  ): Promise<boolean> {
+    // Upsert source record
+    const { data: sourceRecord } = await this.supabase
+      .from('source_records')
+      .upsert(
+        {
+          route_id: routeId ?? null,
+          source_url: url,
+          source_type: sourceType,
+          crawl_status: 'crawling',
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: 'id' },
+      )
+      .select('id, content_hash')
+      .single();
+
+    const sourceRecordId: string | undefined = sourceRecord?.id;
+    const previousHash: string | undefined = sourceRecord?.content_hash ?? undefined;
+
+    // ── Call Firecrawl v1 with correct params ──
+    let markdownContent: string;
+    try {
+      const response = await axios.post(
+        `${this.firecrawlBaseUrl}/scrape`,
+        {
+          url,
+          formats: ['markdown'],
+          onlyMainContent: true,
+          blockAds: true,
+          // proxy: "stealth" handles Cloudflare-protected pages (VFS, embassy sites)
+          proxy: 'stealth',
+          waitFor: 4000,
+          timeout: 35000,
+          headers: {
+            'Accept-Language': 'en-US,en;q=0.9',
+          },
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            'Content-Type': 'application/json',
+          },
+          timeout: 45000,
+        },
+      );
+
+      // Firecrawl v1 response shape: { success: true, data: { markdown: "..." } }
+      markdownContent = response.data?.data?.markdown ?? '';
+    } catch (err: any) {
+      const msg = err?.response?.data?.error ?? err?.message ?? String(err);
+      this.logger.warn(`Firecrawl failed [${sourceType}] ${url}: ${msg}`);
+      if (sourceRecordId) {
+        await this.supabase.from('source_records').update({
+          crawl_status: 'failed',
+          error_message: msg.slice(0, 500),
+          updated_at: new Date().toISOString(),
+        }).eq('id', sourceRecordId);
+      }
+      return false;
+    }
+
+    if (!markdownContent?.trim()) {
+      this.logger.warn(`Empty content from [${sourceType}] ${url}`);
+      return false;
+    }
+
+    const newHash = hashContent(markdownContent);
+
+    // No change detected — just update last_crawled_at
+    if (previousHash && previousHash === newHash) {
+      this.logger.log(`No change detected [${sourceType}] — skipping extraction`);
+      if (sourceRecordId) {
+        await this.supabase.from('source_records').update({
+          crawl_status: 'success',
+          last_crawled_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        }).eq('id', sourceRecordId);
+      }
+      return true;
+    }
+
+    // Content changed — extract structured data
+    this.logger.log(`Content changed [${sourceType}] — running LLM extraction`);
+    const extracted = await this.extractionService.extractVisaData(markdownContent, origin, destination);
+
+    // Persist extracted data
+    const resolvedRouteId = routeId ?? await this.resolveRouteId(origin, destination);
+    if (resolvedRouteId) {
+      await this.persistExtractedData(resolvedRouteId, extracted, origin, destination);
+
+      if (previousHash && sourceRecordId) {
+        await this.logChange(resolvedRouteId, url, 'content_hash', previousHash, newHash);
+      }
+    }
+
+    // Update source record
+    if (sourceRecordId) {
+      await this.supabase.from('source_records').update({
+        route_id: resolvedRouteId ?? null,
+        crawl_status: 'success',
+        content_hash: newHash,
+        last_crawled_at: new Date().toISOString(),
+        error_message: null,
+        updated_at: new Date().toISOString(),
+      }).eq('id', sourceRecordId);
+    }
+
+    this.logger.log(`✅ Crawled & persisted [${sourceType}] ${origin}->${destination}`);
+    return true;
+  }
+
+  // ─── Data Persistence ────────────────────────────────────────────────────────
+
+  private async resolveRouteId(origin: string, destination: string): Promise<string | null> {
+    const { data } = await this.supabase
+      .from('visa_routes')
+      .select('id')
+      .eq('origin_country', origin.toUpperCase())
+      .eq('destination_country', destination.toUpperCase())
+      .single();
+
+    if (data) return data.id;
+
+    const { data: newRoute } = await this.supabase
+      .from('visa_routes')
+      .insert({
+        origin_country: origin.toUpperCase(),
+        destination_country: destination.toUpperCase(),
+        route_status: 'active',
+        visa_category: 'Schengen Short Stay',
+      })
+      .select('id')
+      .single();
+
+    return newRoute?.id ?? null;
+  }
+
+  private async persistExtractedData(
+    routeId: string,
+    data: ExtractedVisaData,
+    origin: string,
+    destination: string,
+  ): Promise<void> {
+    const now = new Date().toISOString();
+    const isSchengen = isSchengenCountry(destination);
+
+    // Helper: pick the crawled value only if it's meaningful, else keep existing
+    const merge = <T>(crawled: T | null | undefined, existing: T | null | undefined): T | null =>
+      crawled !== null && crawled !== undefined ? crawled : (existing ?? null);
+
+    // ── Merge requirements (NEVER overwrite good data with nulls) ──
+    const { data: existingReq } = await this.supabase
+      .from('visa_requirements')
+      .select('*')
+      .eq('route_id', routeId)
+      .maybeSingle();
+
+    const reqPayload = {
+      route_id: routeId,
+      visa_fee: merge(data.visa_fee, existingReq?.visa_fee) ?? (isSchengen ? 90 : null),
+      visa_fee_currency: merge(data.visa_fee_currency, existingReq?.visa_fee_currency) ?? (isSchengen ? 'EUR' : null),
+      service_fee: merge(data.service_fee, existingReq?.service_fee),
+      processing_time_min: merge(data.processing_time_min, existingReq?.processing_time_min) ?? (isSchengen ? 15 : null),
+      processing_time_max: merge(data.processing_time_max, existingReq?.processing_time_max) ?? (isSchengen ? 45 : null),
+      insurance_required: merge(data.insurance_required, existingReq?.insurance_required) ?? (isSchengen ? true : null),
+      insurance_min_coverage: merge(data.insurance_min_coverage, existingReq?.insurance_min_coverage) ?? (isSchengen ? 30000 : null),
+      vaccination_required: merge(data.vaccination_required, existingReq?.vaccination_required) ?? false,
+      vaccination_notes: merge(data.vaccination_notes, existingReq?.vaccination_notes),
+      min_passport_validity_days: merge(data.min_passport_validity_days, existingReq?.min_passport_validity_days) ?? (isSchengen ? 90 : null),
+      eligibility_notes: merge(data.eligibility_notes, existingReq?.eligibility_notes),
+      last_verified_at: now,
+      data_freshness_status: 'fresh',
+      // Keep the higher confidence (seeded Schengen data is 'high')
+      confidence_level: existingReq?.confidence_level === 'high'
+        ? 'high'
+        : (data.source_confidence ?? existingReq?.confidence_level ?? 'medium'),
+      updated_at: now,
+    };
+
+    if (existingReq) {
+      await this.supabase.from('visa_requirements').update(reqPayload).eq('id', existingReq.id);
+    } else {
+      await this.supabase.from('visa_requirements').insert(reqPayload);
+    }
+
+    // ── Replace documents ONLY if crawl found a richer list than what exists ──
+    if (data.documents && data.documents.length > 0) {
+      const { count: existingDocCount } = await this.supabase
+        .from('visa_documents')
+        .select('id', { count: 'exact', head: true })
+        .eq('route_id', routeId);
+
+      // Only overwrite if the crawled list is at least as complete as the existing
+      // (prevents a poor crawl from wiping the standard Schengen checklist)
+      if (data.documents.length >= (existingDocCount ?? 0)) {
+        await this.supabase.from('visa_documents').delete().eq('route_id', routeId);
+        await this.supabase.from('visa_documents').insert(
+          data.documents.map((doc, idx) => ({
+            route_id: routeId,
+            document_name: doc.name,
+            is_mandatory: doc.mandatory,
+            notes: doc.notes ?? null,
+            display_order: idx,
+          })),
+        );
+      }
+    }
+
+    // ── Replace VAC centers (only if extracted) ──
+    if (data.vac_centers && data.vac_centers.length > 0) {
+      await this.supabase.from('vac_centers')
+        .delete()
+        .eq('origin_country', origin.toUpperCase())
+        .eq('destination_country', destination.toUpperCase());
+
+      await this.supabase.from('vac_centers').insert(
+        data.vac_centers.map(c => ({
+          origin_country: origin.toUpperCase(),
+          destination_country: destination.toUpperCase(),
+          city: c.city,
+          address: c.address ?? null,
+          phone: c.phone ?? null,
+          working_hours: c.working_hours ?? null,
+          is_active: true,
+          updated_at: now,
+        })),
+      );
+    }
+
+    // ── Append advisories ──
+    if (data.advisories && data.advisories.length > 0) {
+      await this.supabase.from('travel_advisories').insert(
+        data.advisories.map(a => ({
+          route_id: routeId,
+          advisory_type: a.type ?? 'general',
+          title: a.title,
+          description: a.description,
+          is_active: true,
+          created_at: now,
+        })),
+      );
+    }
+
+    // ── Update route status to active ──
+    await this.supabase.from('visa_routes').update({
+      route_status: 'active',
+      application_center: 'VFS Global',
+      updated_at: now,
+    }).eq('id', routeId);
+  }
+
+  private async logChange(
+    routeId: string,
+    sourceUrl: string,
+    fieldName: string,
+    oldValue: string,
+    newValue: string,
+  ): Promise<void> {
+    await this.supabase.from('change_logs').insert({
+      route_id: routeId,
+      table_name: 'source_records',
+      field_name: fieldName,
+      old_value: oldValue,
+      new_value: newValue,
+      detected_at: new Date().toISOString(),
+      source_url: sourceUrl,
+    });
+  }
+}
