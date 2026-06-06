@@ -13,6 +13,10 @@ WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 
+# Ensure a public/ folder always exists (Next.js projects without static
+# assets have none, but the runner stage copies it).
+RUN mkdir -p public
+
 # Bake the public API URL into the build (NEXT_PUBLIC_* is compile-time)
 ARG NEXT_PUBLIC_API_URL=/api
 ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
