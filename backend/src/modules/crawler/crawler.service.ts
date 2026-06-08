@@ -17,6 +17,11 @@ import {
   SCHENGEN_STANDARD_DOCUMENTS,
   isSchengenCountry,
 } from './schengen-standard-data';
+import {
+  INDIA_VAC_CENTERS,
+  INDIA_VFS_SERVICE_FEE_INR,
+  INDIA_VFS_SERVICE_FEE_CURRENCY,
+} from './india-vfs-data';
 
 // ─── ISO alpha-2 → ISO alpha-3 lowercase (VFS URL format) ────────────────────
 // VFS URL pattern: https://visa.vfsglobal.com/{origin3}/en/{dest3}/
@@ -208,11 +213,16 @@ export class CrawlerService {
   ): Promise<void> {
     const now = new Date().toISOString();
     const std = SCHENGEN_STANDARD_REQUIREMENTS;
+    const isFromIndia = origin.toUpperCase() === 'IN';
+
+    // India applicants pay a VFS service fee (INR) on top of the €90 consular fee
+    const serviceFee = isFromIndia ? INDIA_VFS_SERVICE_FEE_INR : null;
+    const serviceFeeCurrency = isFromIndia ? INDIA_VFS_SERVICE_FEE_CURRENCY : null;
 
     // Only seed requirements if none exist yet (don't overwrite richer crawled data)
     const { data: existingReq } = await this.supabase
       .from('visa_requirements')
-      .select('id')
+      .select('id, service_fee')
       .eq('route_id', routeId)
       .maybeSingle();
 
@@ -221,7 +231,8 @@ export class CrawlerService {
         route_id: routeId,
         visa_fee: std.visa_fee,
         visa_fee_currency: std.visa_fee_currency,
-        service_fee: null,
+        service_fee: serviceFee,
+        service_fee_currency: serviceFeeCurrency,
         processing_time_min: std.processing_time_min,
         processing_time_max: std.processing_time_max,
         insurance_required: std.insurance_required,
@@ -235,6 +246,16 @@ export class CrawlerService {
         confidence_level: 'high',
         updated_at: now,
       });
+    } else if (isFromIndia && existingReq.service_fee === null) {
+      // Backfill the VFS service fee on routes that were seeded before this data existed
+      await this.supabase
+        .from('visa_requirements')
+        .update({
+          service_fee: serviceFee,
+          service_fee_currency: serviceFeeCurrency,
+          updated_at: now,
+        })
+        .eq('id', existingReq.id);
     }
 
     // Seed standard document checklist if no documents exist yet
@@ -254,6 +275,33 @@ export class CrawlerService {
           display_order: idx,
         })),
       );
+    }
+
+    // Seed India VFS Visa Application Centres if none exist for this route yet
+    if (isFromIndia) {
+      const { data: existingVac } = await this.supabase
+        .from('vac_centers')
+        .select('id')
+        .eq('origin_country', origin.toUpperCase())
+        .eq('destination_country', destination.toUpperCase())
+        .limit(1);
+
+      if (!existingVac || existingVac.length === 0) {
+        await this.supabase.from('vac_centers').insert(
+          INDIA_VAC_CENTERS.map((c) => ({
+            origin_country: origin.toUpperCase(),
+            destination_country: destination.toUpperCase(),
+            center_name: c.center_name,
+            city: c.city,
+            address: c.address,
+            phone: c.phone,
+            email: c.email,
+            working_hours: c.working_hours,
+            is_active: true,
+            updated_at: now,
+          })),
+        );
+      }
     }
 
     // Mark route active
