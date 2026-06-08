@@ -248,36 +248,42 @@ export class CrawlerService {
       await this.supabase.from('visa_requirements').insert(reqPayload);
     }
 
-    // 3) Replace documents with the real VFS list (if the LLM found any)
-    if (extracted?.documents && extracted.documents.length > 0) {
-      await this.supabase.from('visa_documents').delete().eq('route_id', routeId);
-      await this.supabase.from('visa_documents').insert(
-        extracted.documents.map((doc, idx) => ({
+    // 3) Documents: real VFS docs (labelled [VFS]) + standard Schengen
+    //    checklist (labelled [STD]) for anything VFS doesn't cover. The
+    //    [VFS]/[STD] prefix lets the frontend show a clear source badge.
+    const vfsDocs = (extracted?.documents ?? []).map((doc, idx) => ({
+      route_id: routeId,
+      document_name: doc.name,
+      is_mandatory: doc.mandatory,
+      notes: `[VFS] ${doc.notes ?? ''}`.trim(),
+      display_order: idx,
+    }));
+
+    // Keywords already covered by VFS docs (so we don't duplicate them)
+    const covered = vfsDocs.map((d) => d.document_name.toLowerCase());
+    const isCovered = (name: string) => {
+      const n = name.toLowerCase();
+      const key = n.split(' ')[0];
+      return covered.some((c) => c.includes(key) || n.includes(c.split(' ')[0]));
+    };
+
+    let stdDocs: any[] = [];
+    if (isSchengenCountry(destination)) {
+      stdDocs = SCHENGEN_STANDARD_DOCUMENTS.filter((doc) => !isCovered(doc.name)).map(
+        (doc, i) => ({
           route_id: routeId,
           document_name: doc.name,
           is_mandatory: doc.mandatory,
-          notes: doc.notes ?? null,
-          display_order: idx,
-        })),
+          notes: `[STD] ${doc.notes ?? ''}`.trim(),
+          display_order: vfsDocs.length + i,
+        }),
       );
-    } else if (isSchengenCountry(destination)) {
-      // No docs from VFS → ensure the standard checklist is present
-      const { data: existingDocs } = await this.supabase
-        .from('visa_documents')
-        .select('id')
-        .eq('route_id', routeId)
-        .limit(1);
-      if (!existingDocs || existingDocs.length === 0) {
-        await this.supabase.from('visa_documents').insert(
-          SCHENGEN_STANDARD_DOCUMENTS.map((doc, idx) => ({
-            route_id: routeId,
-            document_name: doc.name,
-            is_mandatory: doc.mandatory,
-            notes: doc.notes,
-            display_order: idx,
-          })),
-        );
-      }
+    }
+
+    const allDocs = [...vfsDocs, ...stdDocs];
+    if (allDocs.length > 0) {
+      await this.supabase.from('visa_documents').delete().eq('route_id', routeId);
+      await this.supabase.from('visa_documents').insert(allDocs);
     }
 
     // 4) Replace VAC centres with the REAL ones from VFS Contentful
@@ -374,7 +380,7 @@ export class CrawlerService {
           route_id: routeId,
           document_name: doc.name,
           is_mandatory: doc.mandatory,
-          notes: doc.notes,
+          notes: `[STD] ${doc.notes ?? ''}`.trim(),
           display_order: idx,
         })),
       );

@@ -40,10 +40,42 @@ function safeNum(val: number | null | undefined, suffix?: string): React.ReactNo
   return `${val}${suffix || ''}`;
 }
 
+// Parses the [VFS]/[STD] source prefix the backend adds to notes.
+function parseDocSource(notes: string | null): {
+  source: 'vfs' | 'std' | null;
+  cleanNotes: string | null;
+} {
+  if (!notes) return { source: null, cleanNotes: null };
+  const m = notes.match(/^\[(VFS|STD)\]\s*/i);
+  if (!m) return { source: null, cleanNotes: notes };
+  const source = m[1].toUpperCase() === 'VFS' ? 'vfs' : 'std';
+  const cleanNotes = notes.slice(m[0].length).trim() || null;
+  return { source, cleanNotes };
+}
+
+function SourceBadge({ source }: { source: 'vfs' | 'std' }) {
+  if (source === 'vfs') {
+    return (
+      <span className="text-[10px] font-bold uppercase tracking-wide bg-green-100 text-green-700 border border-green-200 rounded px-1.5 py-0.5">
+        VFS
+      </span>
+    );
+  }
+  return (
+    <span
+      className="text-[10px] font-bold uppercase tracking-wide bg-blue-100 text-blue-700 border border-blue-200 rounded px-1.5 py-0.5"
+      title="Standard Schengen requirement — verify with VFS"
+    >
+      Standard
+    </span>
+  );
+}
+
 // ── Expandable document row ──────────────────────────────────────────────────
 function DocumentRow({ doc }: { doc: VisaDocument }) {
   const [open, setOpen] = useState(false);
-  const hasExtra = doc.notes || doc.validity_notes;
+  const { source, cleanNotes } = parseDocSource(doc.notes);
+  const hasExtra = cleanNotes || doc.validity_notes;
 
   return (
     <div className="border border-vfs-border rounded-lg overflow-hidden">
@@ -56,8 +88,9 @@ function DocumentRow({ doc }: { doc: VisaDocument }) {
         ) : (
           <Square className="w-4 h-4 text-gray-400 flex-shrink-0 mt-0.5" />
         )}
-        <div className="flex-1 min-w-0">
+        <div className="flex-1 min-w-0 flex items-center gap-2">
           <p className="text-sm font-medium text-vfs-text">{doc.document_name}</p>
+          {source && <SourceBadge source={source} />}
         </div>
         {hasExtra && (
           <button className="text-gray-400">
@@ -67,7 +100,7 @@ function DocumentRow({ doc }: { doc: VisaDocument }) {
       </div>
       {open && hasExtra && (
         <div className="px-4 pb-3 pt-0 bg-gray-50 border-t border-vfs-border space-y-1">
-          {doc.notes && <p className="text-xs text-gray-600">{doc.notes}</p>}
+          {cleanNotes && <p className="text-xs text-gray-600">{cleanNotes}</p>}
           {doc.validity_notes && (
             <p className="text-xs text-amber-700 flex items-center gap-1">
               <Info className="w-3 h-3" /> {doc.validity_notes}
