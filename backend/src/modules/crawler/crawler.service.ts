@@ -17,11 +17,7 @@ import {
   SCHENGEN_STANDARD_DOCUMENTS,
   isSchengenCountry,
 } from './schengen-standard-data';
-import {
-  INDIA_VAC_CENTERS,
-  INDIA_VFS_SERVICE_FEE_INR,
-  INDIA_VFS_SERVICE_FEE_CURRENCY,
-} from './india-vfs-data';
+import { VfsContentfulService, VfsRouteData } from '../vfs/vfs-contentful.service';
 
 // ─── ISO alpha-2 → ISO alpha-3 lowercase (VFS URL format) ────────────────────
 // VFS URL pattern: https://visa.vfsglobal.com/{origin3}/en/{dest3}/
@@ -90,6 +86,7 @@ export class CrawlerService {
     @Inject(SUPABASE_CLIENT) private readonly supabase: SupabaseClient,
     private readonly configService: ConfigService,
     private readonly extractionService: ExtractionService,
+    private readonly vfsContentful: VfsContentfulService,
     @InjectQueue(CRAWL_QUEUE_NAME) private readonly crawlQueue: Queue,
   ) {}
 
@@ -160,44 +157,165 @@ export class CrawlerService {
   // ─── Core Crawl Orchestrator ─────────────────────────────────────────────────
 
   async crawlRoute(origin: string, destination: string, routeId?: string): Promise<void> {
-    const apiKey = this.configService.getOrThrow<string>('FIRECRAWL_API_KEY');
     const orig = origin.toUpperCase();
     const dest = destination.toUpperCase();
     const key = `${orig}-${dest}`;
 
     try {
-      // ── STEP 1: For Schengen routes, seed the standard knowledge base FIRST ──
-      // This guarantees the route resolves quickly with accurate, complete data
-      // (fees, documents, insurance) regardless of whether the live crawl succeeds.
-      if (isSchengenCountry(dest)) {
-        const resolvedRouteId = routeId ?? (await this.resolveRouteId(orig, dest));
-        if (resolvedRouteId) {
-          await this.seedSchengenStandardData(resolvedRouteId, orig, dest);
-          this.logger.log(`Seeded standard Schengen data for ${orig}->${dest}`);
-        }
+      const resolvedRouteId = routeId ?? (await this.resolveRouteId(orig, dest));
+      if (!resolvedRouteId) {
+        this.logger.warn(`Could not resolve route id for ${orig}->${dest}`);
+        return;
       }
 
-      // ── STEP 2: Crawl live sources IN PARALLEL to enrich/confirm ──
-      const urls = this.buildCrawlUrls(orig, dest);
-      this.logger.log(`Starting parallel crawl for ${orig}->${dest} | ${urls.length} URLs`);
+      // ── PRIMARY: fetch REAL VFS data from the Contentful API ──
+      let vfsData: VfsRouteData | null = null;
+      try {
+        vfsData = await this.vfsContentful.fetchRouteData(orig, dest);
+      } catch (e) {
+        this.logger.warn(
+          `VFS Contentful fetch failed for ${orig}->${dest}: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
 
-      const results = await Promise.allSettled(
-        urls.map(({ url, type }) =>
-          this.crawlSingleUrl(url, type, orig, dest, routeId, apiKey),
-        ),
-      );
-
-      const successCount = results.filter(
-        (r) => r.status === 'fulfilled' && r.value === true,
-      ).length;
-
-      this.logger.log(
-        `Crawl complete for ${orig}->${dest}: ${successCount}/${urls.length} URLs succeeded`,
-      );
+      if (vfsData?.found) {
+        await this.persistVfsData(resolvedRouteId, orig, dest, vfsData);
+        this.logger.log(`✅ Persisted REAL VFS data for ${orig}->${dest}`);
+      } else if (isSchengenCountry(dest)) {
+        // ── FALLBACK: VFS returned nothing → use Schengen standard checklist ──
+        // (covers the page so it isn't empty; clearly the EU-standard baseline)
+        await this.seedSchengenStandardData(resolvedRouteId, orig, dest);
+        this.logger.log(`VFS empty — seeded Schengen standard fallback for ${orig}->${dest}`);
+      } else {
+        this.logger.warn(`No VFS data and non-Schengen route ${orig}->${dest} — nothing to persist`);
+      }
     } finally {
       // Always release the in-flight lock so future searches can re-crawl
       this.inFlightCrawls.delete(key);
     }
+  }
+
+  /**
+   * Persists REAL VFS data: VAC centres (clean structured) + fee/document
+   * fields extracted from the live VFS content via the LLM.
+   */
+  private async persistVfsData(
+    routeId: string,
+    origin: string,
+    destination: string,
+    vfs: VfsRouteData,
+  ): Promise<void> {
+    const now = new Date().toISOString();
+
+    // 1) Extract structured fee + document fields from the real VFS text via Gemini
+    let extracted = null as Awaited<ReturnType<ExtractionService['extractVisaData']>> | null;
+    const combinedText = `${vfs.feesText}\n\n${vfs.documentsText}`.trim();
+    if (combinedText.length > 50) {
+      extracted = await this.extractionService.extractVisaData(combinedText, origin, destination);
+    }
+
+    // 2) Persist requirements (real fee from VFS; Schengen defaults only fill gaps)
+    const schengen = isSchengenCountry(destination);
+    const reqPayload: Record<string, any> = {
+      route_id: routeId,
+      visa_fee: extracted?.visa_fee ?? (schengen ? 90 : null),
+      visa_fee_currency: extracted?.visa_fee_currency ?? (schengen ? 'EUR' : null),
+      service_fee: extracted?.service_fee ?? null,
+      service_fee_currency: extracted?.service_fee ? 'INR' : null,
+      processing_time_min: extracted?.processing_time_min ?? (schengen ? 15 : null),
+      processing_time_max: extracted?.processing_time_max ?? (schengen ? 45 : null),
+      insurance_required: extracted?.insurance_required ?? (schengen ? true : null),
+      insurance_min_coverage: extracted?.insurance_min_coverage ?? (schengen ? 30000 : null),
+      vaccination_required: extracted?.vaccination_required ?? false,
+      vaccination_notes: extracted?.vaccination_notes ?? null,
+      min_passport_validity_days: extracted?.min_passport_validity_days ?? (schengen ? 90 : null),
+      eligibility_notes: extracted?.eligibility_notes ?? null,
+      last_verified_at: now,
+      data_freshness_status: 'fresh',
+      confidence_level: 'high', // sourced directly from VFS
+      updated_at: now,
+    };
+
+    const { data: existingReq } = await this.supabase
+      .from('visa_requirements')
+      .select('id')
+      .eq('route_id', routeId)
+      .maybeSingle();
+
+    if (existingReq) {
+      await this.supabase.from('visa_requirements').update(reqPayload).eq('id', existingReq.id);
+    } else {
+      await this.supabase.from('visa_requirements').insert(reqPayload);
+    }
+
+    // 3) Replace documents with the real VFS list (if the LLM found any)
+    if (extracted?.documents && extracted.documents.length > 0) {
+      await this.supabase.from('visa_documents').delete().eq('route_id', routeId);
+      await this.supabase.from('visa_documents').insert(
+        extracted.documents.map((doc, idx) => ({
+          route_id: routeId,
+          document_name: doc.name,
+          is_mandatory: doc.mandatory,
+          notes: doc.notes ?? null,
+          display_order: idx,
+        })),
+      );
+    } else if (isSchengenCountry(destination)) {
+      // No docs from VFS → ensure the standard checklist is present
+      const { data: existingDocs } = await this.supabase
+        .from('visa_documents')
+        .select('id')
+        .eq('route_id', routeId)
+        .limit(1);
+      if (!existingDocs || existingDocs.length === 0) {
+        await this.supabase.from('visa_documents').insert(
+          SCHENGEN_STANDARD_DOCUMENTS.map((doc, idx) => ({
+            route_id: routeId,
+            document_name: doc.name,
+            is_mandatory: doc.mandatory,
+            notes: doc.notes,
+            display_order: idx,
+          })),
+        );
+      }
+    }
+
+    // 4) Replace VAC centres with the REAL ones from VFS Contentful
+    if (vfs.vacCenters.length > 0) {
+      await this.supabase
+        .from('vac_centers')
+        .delete()
+        .eq('origin_country', origin)
+        .eq('destination_country', destination);
+
+      await this.supabase.from('vac_centers').insert(
+        vfs.vacCenters.map((c) => ({
+          origin_country: origin,
+          destination_country: destination,
+          center_name: `VFS Global Visa Application Centre – ${c.city}`,
+          city: c.city,
+          address: c.google_map_url, // map link as the locatable address
+          phone: null,
+          email: null,
+          working_hours: c.working_hours,
+          is_active: true,
+          updated_at: now,
+        })),
+      );
+    }
+
+    // 5) Mark route active
+    await this.supabase
+      .from('visa_routes')
+      .update({
+        route_status: 'active',
+        application_center: 'VFS Global',
+        visa_category: isSchengenCountry(destination)
+          ? 'Schengen Short Stay (Type C)'
+          : 'Short Stay',
+        updated_at: now,
+      })
+      .eq('id', routeId);
   }
 
   /**
@@ -213,16 +331,11 @@ export class CrawlerService {
   ): Promise<void> {
     const now = new Date().toISOString();
     const std = SCHENGEN_STANDARD_REQUIREMENTS;
-    const isFromIndia = origin.toUpperCase() === 'IN';
 
-    // India applicants pay a VFS service fee (INR) on top of the €90 consular fee
-    const serviceFee = isFromIndia ? INDIA_VFS_SERVICE_FEE_INR : null;
-    const serviceFeeCurrency = isFromIndia ? INDIA_VFS_SERVICE_FEE_CURRENCY : null;
-
-    // Only seed requirements if none exist yet (don't overwrite richer crawled data)
+    // Only seed requirements if none exist yet (don't overwrite richer VFS data)
     const { data: existingReq } = await this.supabase
       .from('visa_requirements')
-      .select('id, service_fee')
+      .select('id')
       .eq('route_id', routeId)
       .maybeSingle();
 
@@ -231,8 +344,8 @@ export class CrawlerService {
         route_id: routeId,
         visa_fee: std.visa_fee,
         visa_fee_currency: std.visa_fee_currency,
-        service_fee: serviceFee,
-        service_fee_currency: serviceFeeCurrency,
+        service_fee: null, // service fee comes only from real VFS data — never hardcoded
+        service_fee_currency: null,
         processing_time_min: std.processing_time_min,
         processing_time_max: std.processing_time_max,
         insurance_required: std.insurance_required,
@@ -243,19 +356,9 @@ export class CrawlerService {
         eligibility_notes: std.eligibility_notes,
         last_verified_at: now,
         data_freshness_status: 'fresh',
-        confidence_level: 'high',
+        confidence_level: 'medium', // EU-standard baseline, not route-specific VFS data
         updated_at: now,
       });
-    } else if (isFromIndia && existingReq.service_fee === null) {
-      // Backfill the VFS service fee on routes that were seeded before this data existed
-      await this.supabase
-        .from('visa_requirements')
-        .update({
-          service_fee: serviceFee,
-          service_fee_currency: serviceFeeCurrency,
-          updated_at: now,
-        })
-        .eq('id', existingReq.id);
     }
 
     // Seed standard document checklist if no documents exist yet
@@ -275,33 +378,6 @@ export class CrawlerService {
           display_order: idx,
         })),
       );
-    }
-
-    // Seed India VFS Visa Application Centres if none exist for this route yet
-    if (isFromIndia) {
-      const { data: existingVac } = await this.supabase
-        .from('vac_centers')
-        .select('id')
-        .eq('origin_country', origin.toUpperCase())
-        .eq('destination_country', destination.toUpperCase())
-        .limit(1);
-
-      if (!existingVac || existingVac.length === 0) {
-        await this.supabase.from('vac_centers').insert(
-          INDIA_VAC_CENTERS.map((c) => ({
-            origin_country: origin.toUpperCase(),
-            destination_country: destination.toUpperCase(),
-            center_name: c.center_name,
-            city: c.city,
-            address: c.address,
-            phone: c.phone,
-            email: c.email,
-            working_hours: c.working_hours,
-            is_active: true,
-            updated_at: now,
-          })),
-        );
-      }
     }
 
     // Mark route active

@@ -4,6 +4,7 @@ import { ConfigService } from '@nestjs/config';
 import { CrawlerService } from './crawler.service';
 import { CrawlerProcessor } from './crawler.processor';
 import { ExtractionModule } from '../extraction/extraction.module';
+import { VfsModule } from '../vfs/vfs.module';
 import { CRAWL_QUEUE_NAME } from './crawler.queue';
 
 @Module({
@@ -45,6 +46,7 @@ import { CRAWL_QUEUE_NAME } from './crawler.queue';
       name: CRAWL_QUEUE_NAME,
     }),
     ExtractionModule,
+    VfsModule,
   ],
   providers: [CrawlerService, CrawlerProcessor],
   exports: [CrawlerService, BullModule],
