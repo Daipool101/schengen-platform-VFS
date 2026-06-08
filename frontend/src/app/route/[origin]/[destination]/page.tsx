@@ -677,7 +677,18 @@ export default function RouteResultsPage() {
                       {center.address && (
                         <div className="flex items-start gap-1.5">
                           <MapPin className="w-3 h-3 flex-shrink-0 mt-0.5 text-gray-400" />
-                          <span>{center.address}</span>
+                          {/^https?:\/\//.test(center.address) ? (
+                            <a
+                              href={center.address}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="text-vfs-red hover:underline font-medium"
+                            >
+                              View on Google Maps →
+                            </a>
+                          ) : (
+                            <span>{center.address}</span>
+                          )}
                         </div>
                       )}
                       {center.phone && (
