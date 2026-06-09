@@ -47,13 +47,14 @@ export class VfsVisaTypeService {
 
     const name = `${dest3} > ${orig3} > en`;
 
-    // Fetch with one empty-retry: under rapid concurrent crawls the Contentful
-    // endpoint sometimes returns an empty array; a short wait + retry recovers it.
+    // Fetch with empty-retries: under load the Contentful endpoint sometimes
+    // throttles and returns an empty array. Retry with increasing backoff.
     let data = await this.query('onePager', { 'fields.name': name, include: '10' });
-    if (data && (data.total ?? 0) === 0) {
-      await new Promise((r) => setTimeout(r, 2500));
+    const backoffs = [3000, 6000, 9000];
+    for (let i = 0; data && (data.total ?? 0) === 0 && i < backoffs.length; i++) {
+      await new Promise((r) => setTimeout(r, backoffs[i]));
       const retry = await this.query('onePager', { 'fields.name': name, include: '10' });
-      if (retry && (retry.total ?? 0) > 0) data = retry;
+      if (retry) data = retry;
     }
     if (!data || (data.total ?? 0) === 0) {
       this.logger.log(`No onePager for ${name} — route may not publish visa-type data`);
