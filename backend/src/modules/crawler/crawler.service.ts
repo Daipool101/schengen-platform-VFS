@@ -228,15 +228,26 @@ export class CrawlerService {
 
     // Mirror the VFS service charge into the Visa Overview's Service Fee field
     const svc = visaTypes.find((v) => v.service_fee != null);
+    // Real processing time text from VFS (e.g. Business Visit) → Visa Overview
+    const ptText = visaTypes.find((v) => v.processing_time)?.processing_time ?? null;
+    const reqUpdate: Record<string, any> = { updated_at: now };
     if (svc) {
-      await this.supabase
-        .from('visa_requirements')
-        .update({
-          service_fee: svc.service_fee,
-          service_fee_currency: svc.service_fee_currency,
-          updated_at: now,
-        })
-        .eq('route_id', routeId);
+      reqUpdate.service_fee = svc.service_fee;
+      reqUpdate.service_fee_currency = svc.service_fee_currency;
+    }
+    if (ptText) {
+      // Pull day-counts from the VFS text (ignores "48-72 hours" — needs "days")
+      const days = [...ptText.matchAll(/(\d+)\s*(?:calendar\s*)?days?/gi)].map((m) =>
+        parseInt(m[1], 10),
+      );
+      if (days.length) {
+        reqUpdate.processing_time_min = Math.min(...days);
+        reqUpdate.processing_time_max = days.length > 1 ? Math.max(...days) : Math.min(...days);
+      }
+      reqUpdate.processing_time_notes = ptText.slice(0, 500);
+    }
+    if (svc || ptText) {
+      await this.supabase.from('visa_requirements').update(reqUpdate).eq('route_id', routeId);
     }
 
     // Clear previous visa types for this route (cascades to fees/docs)

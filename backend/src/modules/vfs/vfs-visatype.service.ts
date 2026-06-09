@@ -223,6 +223,7 @@ export class VfsVisaTypeService {
       // Fallback: match a fee table by visa-type name (countries that don't embed it)
       if (fees.length === 0) fees = feesByName[this.norm(name)] ?? [];
       const appUrl = this.findEformsLink(info) ?? applicationForm?.url ?? null;
+      const processingTime = this.extractSectionText(info, byId, /processing time/i);
       const checklist = this.matchChecklist(name, pdfs);
 
       out.push({
@@ -235,12 +236,56 @@ export class VfsVisaTypeService {
         checklist_pdf_url: checklist?.url ?? null,
         checklist_name: checklist?.title ?? null,
         application_form_url: appUrl,
-        processing_time: null,
+        processing_time: processingTime,
         photo_specifications: null,
         overview: null,
       });
     }
     return out;
+  }
+
+  /**
+   * Extracts the text of a named section (e.g. "Processing Time") from a
+   * visaInformation doc. Sections are delimited by embedded `tab` entries;
+   * we collect the text between the target tab and the next tab.
+   */
+  private extractSectionText(
+    info: any,
+    byId: Record<string, any>,
+    sectionRe: RegExp,
+  ): string | null {
+    const tokens: Array<{ tab?: string; text?: string }> = [];
+    const walk = (n: any) => {
+      if (!n || typeof n !== 'object') return;
+      if (Array.isArray(n)) { n.forEach(walk); return; }
+      if (n.nodeType?.startsWith('embedded-') && n.data?.target?.sys?.id) {
+        const e = byId[n.data.target.sys.id];
+        if (e?.sys?.contentType?.sys?.id === 'tab') {
+          tokens.push({ tab: e.fields?.tabName ?? '' });
+          return;
+        }
+      }
+      if (n.nodeType === 'text' && n.value) tokens.push({ text: n.value });
+      if (n.content) walk(n.content);
+    };
+    walk(info);
+
+    let collecting = false;
+    const parts: string[] = [];
+    for (const t of tokens) {
+      if (t.tab !== undefined) {
+        if (collecting) break; // reached the next tab → stop
+        if (sectionRe.test(t.tab)) collecting = true;
+        continue;
+      }
+      if (collecting && t.text) parts.push(t.text);
+    }
+    const s = parts
+      .join(' ')
+      .replace(/\s+/g, ' ')
+      .replace(/^processing time[:\s]*/i, '')
+      .trim();
+    return s || null;
   }
 
   /** Finds the fee-table entry embedded within a visaInformation rich-text doc. */
