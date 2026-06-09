@@ -46,11 +46,19 @@ export class VfsVisaTypeService {
     if (!orig3 || !dest3) return [];
 
     const name = `${dest3} > ${orig3} > en`;
-    const data = await this.query('onePager', {
-      'fields.name': name,
-      include: '10',
-    });
-    if (!data) return [];
+
+    // Fetch with one empty-retry: under rapid concurrent crawls the Contentful
+    // endpoint sometimes returns an empty array; a short wait + retry recovers it.
+    let data = await this.query('onePager', { 'fields.name': name, include: '10' });
+    if (data && (data.total ?? 0) === 0) {
+      await new Promise((r) => setTimeout(r, 2500));
+      const retry = await this.query('onePager', { 'fields.name': name, include: '10' });
+      if (retry && (retry.total ?? 0) > 0) data = retry;
+    }
+    if (!data || (data.total ?? 0) === 0) {
+      this.logger.log(`No onePager for ${name} — route may not publish visa-type data`);
+      return [];
+    }
 
     return this.parse(data);
   }
@@ -97,11 +105,14 @@ export class VfsVisaTypeService {
     const allText = this.collectText(data);
     const serviceCharge = this.parseServiceCharge(allText);
 
-    // 2) Fee tables — entries with an HTML `table` field naming a visa type
+    // 2) Fee tables — entries with an HTML `table` field naming a visa type.
+    //    internalName varies by country:
+    //      "Table: Business Visit"  (Poland)
+    //      "aut > ind > en > Tourist Visa > Visa Fees 1"  (Austria)
     const feeTables = entries
       .filter((e) => e?.fields?.table && /visa fee/i.test(e.fields.table))
       .map((e) => ({
-        visaType: (e.fields.internalName || '').replace(/^Table:\s*/i, '').trim(),
+        visaType: this.visaTypeFromInternalName(e.fields.internalName || ''),
         fees: this.parseHtmlFeeTable(e.fields.table),
       }))
       .filter((t) => t.visaType && t.fees.length > 0);
@@ -158,6 +169,26 @@ export class VfsVisaTypeService {
 
     this.logger.log(`Parsed ${visaTypes.length} visa types (${feeTables.length} with fee tables)`);
     return visaTypes;
+  }
+
+  /**
+   * Extracts the visa-type name from a fee-table entry's internalName,
+   * handling the different formats VFS uses across countries.
+   */
+  private visaTypeFromInternalName(internalName: string): string {
+    let s = internalName.replace(/^Table:\s*/i, '').trim();
+    if (s.includes('>')) {
+      const parts = s.split('>').map((p) => p.trim());
+      const meaningful = parts.filter(
+        (p) =>
+          p &&
+          !/^[a-z]{2,3}$/i.test(p) && // locale codes: aut, ind, en
+          !/^visa fees?\s*\d*$/i.test(p) && // "Visa Fees 1"
+          !/^\d+$/.test(p),
+      );
+      s = meaningful[meaningful.length - 1] || s;
+    }
+    return s.replace(/\s+/g, ' ').trim();
   }
 
   private parseHtmlFeeTable(html: string): VfsFeeRow[] {
@@ -221,7 +252,16 @@ export class VfsVisaTypeService {
   private checklistDerivedTypes(
     pdfs: { title: string; url: string | null }[],
   ): { name: string; title: string; url: string | null }[] {
+    // Map checklist filename patterns → a clean visa-type name.
+    // Covers Schengen (C) + National (D) types so countries that publish
+    // checklists but no fee tables still surface their visa types.
     const map: { pattern: RegExp; name: string }[] = [
+      { pattern: /checklist-c-business/i, name: 'Business Visit' },
+      { pattern: /checklist-c-tourism|visiting-family/i, name: 'Tourist Visit' },
+      { pattern: /checklist-c-others-medical/i, name: 'Medical Treatment' },
+      { pattern: /checklist-c-others-cultural|sports|religious|film/i, name: 'Cultural / Sports / Religious' },
+      { pattern: /checklist-c-others-seafarer/i, name: 'Seafarers' },
+      { pattern: /checklist-c-others-research|study-or-other-types-of-internship/i, name: 'Research / Internship' },
       { pattern: /checklist-d-study|checklist_d_study/i, name: 'Study' },
       { pattern: /checklist-d-work/i, name: 'Employment' },
       { pattern: /checklist-d-dependent/i, name: 'Dependent' },
@@ -231,7 +271,9 @@ export class VfsVisaTypeService {
     const out: { name: string; title: string; url: string | null }[] = [];
     for (const m of map) {
       const pdf = pdfs.find((p) => m.pattern.test(p.title) || (p.url && m.pattern.test(p.url)));
-      if (pdf) out.push({ name: m.name, title: pdf.title, url: pdf.url });
+      if (pdf && !out.some((o) => o.name === m.name)) {
+        out.push({ name: m.name, title: pdf.title, url: pdf.url });
+      }
     }
     return out;
   }
