@@ -348,6 +348,10 @@ export default function RouteResultsPage() {
     .filter((d) => !d.is_mandatory)
     .sort((a, b) => a.display_order - b.display_order);
 
+  // When VFS provides official document checklist PDFs (per visa type), those
+  // take priority — hide the standard EU fallback list.
+  const hasVfsChecklist = (visa_types ?? []).some((v) => v.checklist_pdf_url);
+
   const isOpen = route.is_application_allowed;
 
   return (
@@ -484,7 +488,21 @@ export default function RouteResultsPage() {
 
           {/* Section 2 — Required Documents */}
           <Section title="Required Documents" icon={<CheckSquare className="w-4 h-4" />}>
-            {documents.length === 0 ? (
+            {hasVfsChecklist ? (
+              <div className="flex items-start gap-3 bg-vfs-gray border border-vfs-border rounded-lg p-4">
+                <CheckSquare className="w-5 h-5 text-vfs-red flex-shrink-0 mt-0.5" />
+                <div>
+                  <p className="text-sm font-medium text-vfs-text">
+                    Official VFS document checklists are available per visa type.
+                  </p>
+                  <p className="text-xs text-gray-500 mt-1">
+                    Select a visa type in <strong>Visa Types &amp; Fees</strong> above and download
+                    its <strong>Document Checklist (PDF)</strong> for the exact, official list of
+                    required documents.
+                  </p>
+                </div>
+              </div>
+            ) : documents.length === 0 ? (
               <p className="text-gray-400 italic text-sm">Document list not available.</p>
             ) : (
               <div className="space-y-5">
