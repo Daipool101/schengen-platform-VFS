@@ -13,7 +13,6 @@ import {
   Phone,
   Mail,
   Clock,
-  Wifi,
   AlertTriangle,
   Info,
   Shield,
@@ -340,7 +339,7 @@ export default function RouteResultsPage() {
     );
   }
 
-  const { route, requirements, documents, vac_centers, advisories, esim, converted_fee, visa_types } = result;
+  const { route, requirements, documents, vac_centers, advisories, converted_fee, visa_types } = result;
 
   const mandatory = documents
     .filter((d) => d.is_mandatory)
@@ -723,70 +722,6 @@ export default function RouteResultsPage() {
               </div>
             )}
           </Section>
-
-          {/* Section 7 — eSIM */}
-          <Section title="eSIM Recommendation" icon={<Wifi className="w-4 h-4" />}>
-            {esim ? (
-              <div>
-                <div className="flex items-center justify-between mb-3">
-                  <span className="text-sm font-medium text-vfs-text">eSIM Available</span>
-                  <span
-                    className={`px-2.5 py-0.5 rounded-full text-xs font-semibold border ${
-                      esim.is_recommended
-                        ? 'bg-green-50 text-green-700 border-green-200'
-                        : 'bg-gray-50 text-gray-600 border-gray-200'
-                    }`}
-                  >
-                    {esim.is_recommended ? 'Recommended' : 'Not Recommended'}
-                  </span>
-                </div>
-                {esim.providers.length > 0 && (
-                  <div className="mb-2">
-                    <p className="text-xs text-gray-500 mb-1.5 font-medium">Providers:</p>
-                    <div className="flex flex-wrap gap-1.5">
-                      {esim.providers.map((p, i) => (
-                        <span
-                          key={i}
-                          className="bg-vfs-gray border border-vfs-border text-xs font-medium text-vfs-text px-2.5 py-1 rounded-full"
-                        >
-                          {p}
-                        </span>
-                      ))}
-                    </div>
-                  </div>
-                )}
-                {esim.coverage_notes && (
-                  <p className="text-xs text-gray-500 mt-2">{esim.coverage_notes}</p>
-                )}
-              </div>
-            ) : (
-              <p className="text-gray-400 italic text-sm">eSIM recommendation not available.</p>
-            )}
-          </Section>
-
-          {/* Section 8 — Sources */}
-          <div className="bg-white rounded-xl border border-vfs-border shadow-sm p-4">
-            <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">
-              Data Sources
-            </p>
-            <p className="text-xs text-gray-500 leading-relaxed">
-              Data sourced from official VFS Global and government websites.{' '}
-              {requirements?.last_verified_at && (
-                <>
-                  Last verified{' '}
-                  {new Date(requirements.last_verified_at).toLocaleDateString('en-GB', {
-                    day: 'numeric',
-                    month: 'short',
-                    year: 'numeric',
-                  })}
-                  .
-                </>
-              )}
-            </p>
-            <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded p-2 mt-2 leading-snug">
-              Always verify requirements with official sources before travelling.
-            </p>
-          </div>
         </div>
       </div>
     </div>

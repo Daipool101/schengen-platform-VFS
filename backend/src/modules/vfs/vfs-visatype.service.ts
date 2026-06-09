@@ -117,15 +117,36 @@ export class VfsVisaTypeService {
   private parse(data: any): VfsVisaType[] {
     const entries: any[] = data?.includes?.Entry ?? [];
     const assets: any[] = data?.includes?.Asset ?? [];
+    const byId: Record<string, any> = {};
+    entries.forEach((e) => (byId[e.sys.id] = e));
+    const assetById: Record<string, any> = {};
+    assets.forEach((a) => (assetById[a.sys.id] = a));
 
-    // 1) Service charge (shared across the route) — from any rich text
-    const allText = this.collectText(data);
-    const serviceCharge = this.parseServiceCharge(allText);
+    const serviceCharge = this.parseServiceCharge(this.collectText(data));
+    const pdfs = assets
+      .map((a) => ({
+        title: a?.fields?.title ?? '',
+        url: a?.fields?.file?.url ? 'https:' + a.fields.file.url : null,
+      }))
+      .filter((p) => p.url && /\.pdf/i.test(p.url));
+    const applicationForm = pdfs.find((p) =>
+      /application[-\s]?form|sample.*form/i.test(p.title),
+    );
 
-    // 2) Fee tables — entries with an HTML `table` field naming a visa type.
-    //    internalName varies by country:
-    //      "Table: Business Visit"  (Poland)
-    //      "aut > ind > en > Tourist Visa > Visa Fees 1"  (Austria)
+    // ── PRIMARY: the authoritative ordered dropdown (matches the VFS website) ──
+    const vti = entries.find(
+      (e) => e?.sys?.contentType?.sys?.id === 'visaTypeInformation' &&
+        Array.isArray(e?.fields?.visaTypes),
+    );
+    if (vti) {
+      const result = this.parseFromDropdown(vti, byId, assetById, pdfs, applicationForm, serviceCharge);
+      if (result.length > 0) {
+        this.logger.log(`Parsed ${result.length} visa types from dropdown`);
+        return result;
+      }
+    }
+
+    // ── FALLBACK: derive from fee tables (countries without a dropdown entry) ──
     const feeTables = entries
       .filter((e) => e?.fields?.table && /visa fee/i.test(e.fields.table))
       .map((e) => ({
@@ -134,17 +155,6 @@ export class VfsVisaTypeService {
       }))
       .filter((t) => t.visaType && t.fees.length > 0);
 
-    // 3) Checklist + form PDFs from assets
-    const pdfs = assets
-      .map((a) => ({
-        title: a?.fields?.title ?? '',
-        url: a?.fields?.file?.url ? 'https:' + a.fields.file.url : null,
-      }))
-      .filter((p) => p.url && /\.pdf/i.test(p.url));
-
-    const applicationForm = pdfs.find((p) => /application[-\s]?form|sample.*form/i.test(p.title));
-
-    // 4) Build visa types from fee tables (each table = a visa type)
     const visaTypes: VfsVisaType[] = feeTables.map((t) => {
       const checklist = this.matchChecklist(t.visaType, pdfs);
       return {
@@ -163,29 +173,89 @@ export class VfsVisaTypeService {
       };
     });
 
-    // 5) Add visa types that only have a checklist PDF (e.g. National visas with no fee table)
-    const namedFromChecklists = this.checklistDerivedTypes(pdfs);
-    for (const c of namedFromChecklists) {
-      if (!visaTypes.some((v) => this.norm(v.name) === this.norm(c.name))) {
-        visaTypes.push({
-          category: this.guessCategory(c.name, c.title),
-          name: c.name,
-          fees: [],
-          service_fee: serviceCharge?.amount ?? null,
-          service_fee_currency: serviceCharge?.currency ?? null,
-          service_fee_note: serviceCharge?.note ?? null,
-          checklist_pdf_url: c.url,
-          checklist_name: c.title,
-          application_form_url: applicationForm?.url ?? null,
-          processing_time: null,
-          photo_specifications: null,
-          overview: null,
-        });
-      }
-    }
-
-    this.logger.log(`Parsed ${visaTypes.length} visa types (${feeTables.length} with fee tables)`);
+    this.logger.log(`Parsed ${visaTypes.length} visa types (fee-table fallback)`);
     return visaTypes;
+  }
+
+  /**
+   * Builds the visa-type list from the authoritative visaTypeInformation entry,
+   * which holds the EXACT ordered dropdown (matching the VFS website), grouped
+   * under SCHENGEN-VISA / NATIONAL VISA headers.
+   */
+  private parseFromDropdown(
+    vti: any,
+    byId: Record<string, any>,
+    assetById: Record<string, any>,
+    pdfs: { title: string; url: string | null }[],
+    applicationForm: { title: string; url: string | null } | undefined,
+    serviceCharge: { amount: number; currency: string; note: string } | null,
+  ): VfsVisaType[] {
+    const out: VfsVisaType[] = [];
+    let category = 'Schengen Visa';
+
+    for (const link of vti.fields.visaTypes) {
+      const entry = byId[link?.sys?.id];
+      if (!entry) continue;
+      const name = (entry.fields?.visaType ?? '').replace(/\s+/g, ' ').trim();
+      if (!name) continue;
+
+      // Category separators / placeholders
+      if (/please select|^jurisdiction$/i.test(name)) continue;
+      if (/schengen[\s-]*visa/i.test(name)) { category = 'Schengen Visa'; continue; }
+      if (/national\s*visa/i.test(name)) { category = 'National Visa'; continue; }
+
+      // Resolve this type's embedded fee table + application form from visaInformation
+      const info = entry.fields?.visaInformation;
+      const tableEntry = this.findEmbeddedTable(info, byId);
+      const fees = tableEntry ? this.parseHtmlFeeTable(tableEntry.fields.table) : [];
+      const appUrl = this.findEformsLink(info) ?? applicationForm?.url ?? null;
+      const checklist = this.matchChecklist(name, pdfs);
+
+      out.push({
+        category,
+        name,
+        fees,
+        service_fee: serviceCharge?.amount ?? null,
+        service_fee_currency: serviceCharge?.currency ?? null,
+        service_fee_note: serviceCharge?.note ?? null,
+        checklist_pdf_url: checklist?.url ?? null,
+        checklist_name: checklist?.title ?? null,
+        application_form_url: appUrl,
+        processing_time: null,
+        photo_specifications: null,
+        overview: null,
+      });
+    }
+    return out;
+  }
+
+  /** Finds the fee-table entry embedded within a visaInformation rich-text doc. */
+  private findEmbeddedTable(info: any, byId: Record<string, any>): any | null {
+    let found: any = null;
+    const walk = (n: any) => {
+      if (!n || typeof n !== 'object' || found) return;
+      if (Array.isArray(n)) { n.forEach(walk); return; }
+      if (n.nodeType?.startsWith('embedded-') && n.data?.target?.sys?.id) {
+        const e = byId[n.data.target.sys.id];
+        if (e?.fields?.table && /visa fee/i.test(e.fields.table)) { found = e; return; }
+      }
+      if (n.content) walk(n.content);
+    };
+    walk(info);
+    return found;
+  }
+
+  /** Finds the VFS eForms application link within a visaInformation doc. */
+  private findEformsLink(info: any): string | null {
+    let url: string | null = null;
+    const walk = (n: any) => {
+      if (!n || typeof n !== 'object' || url) return;
+      if (Array.isArray(n)) { n.forEach(walk); return; }
+      if (n.data?.uri && /eforms\.vfsglobal/i.test(n.data.uri)) { url = n.data.uri; return; }
+      if (n.content) walk(n.content);
+    };
+    walk(info);
+    return url;
   }
 
   /**

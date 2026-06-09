@@ -226,6 +226,19 @@ export class CrawlerService {
     const now = new Date().toISOString();
     const sourceUrl = `https://visa.vfsglobal.com/${(origin || '').toLowerCase()}/en/${(destination || '').toLowerCase()}/visa-type`;
 
+    // Mirror the VFS service charge into the Visa Overview's Service Fee field
+    const svc = visaTypes.find((v) => v.service_fee != null);
+    if (svc) {
+      await this.supabase
+        .from('visa_requirements')
+        .update({
+          service_fee: svc.service_fee,
+          service_fee_currency: svc.service_fee_currency,
+          updated_at: now,
+        })
+        .eq('route_id', routeId);
+    }
+
     // Clear previous visa types for this route (cascades to fees/docs)
     await this.supabase.from('visa_types').delete().eq('route_id', routeId);
 
