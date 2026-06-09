@@ -200,12 +200,13 @@ export class VfsVisaTypeService {
         (p) =>
           p &&
           !/^[a-z]{2,3}$/i.test(p) && // locale codes: aut, ind, en
-          !/^visa fees?\s*\d*$/i.test(p) && // "Visa Fees 1"
+          !/^(table:\s*)?visa fees?\s*\d*$/i.test(p) && // "Visa Fees 1"
           !/^\d+$/.test(p),
       );
       s = meaningful[meaningful.length - 1] || s;
     }
-    return s.replace(/\s+/g, ' ').trim();
+    // "Table:" can also appear inside a segment (e.g. "Table:Tourist Visa")
+    return s.replace(/^Table:\s*/i, '').replace(/\s+/g, ' ').trim();
   }
 
   private parseHtmlFeeTable(html: string): VfsFeeRow[] {

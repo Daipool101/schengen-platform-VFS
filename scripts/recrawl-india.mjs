@@ -37,6 +37,6 @@ for (const r of targets) {
     } catch {}
   }
   console.log(`  IN -> ${dest}: ${done ? vt + ' visa types' : 'timed out'}`);
-  await sleep(3000); // breathe between routes
+  await sleep(25000); // breathe between routes so Contentful isn't throttled
 }
 console.log('Sequential re-crawl complete.');
