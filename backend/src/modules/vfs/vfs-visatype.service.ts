@@ -209,10 +209,9 @@ export class VfsVisaTypeService {
   }
 
   private parseHtmlFeeTable(html: string): VfsFeeRow[] {
-    const rows: VfsFeeRow[] = [];
-    const trMatches = html.matchAll(/<tr>([\s\S]*?)<\/tr>/gi);
-    for (const tr of trMatches) {
-      const cells = [...tr[1].matchAll(/<t[dh]>([\s\S]*?)<\/t[dh]>/gi)].map((c) =>
+    // Attribute-tolerant cell/row extraction (VFS tables vary: <td> vs <td class="...">)
+    const extractCells = (rowHtml: string): string[] =>
+      [...rowHtml.matchAll(/<t[dh][^>]*>([\s\S]*?)<\/t[dh]>/gi)].map((c) =>
         c[1]
           .replace(/<[^>]+>/g, '')
           .replace(/&#8364;|€/g, '')
@@ -220,13 +219,34 @@ export class VfsVisaTypeService {
           .replace(/\s+/g, ' ')
           .trim(),
       );
-      if (cells.length < 3) continue;
-      // Skip header row
-      if (/visa fee/i.test(cells[1]) || /visa type/i.test(cells[0])) continue;
-      const inr = this.toNumber(cells[1]);
-      const eur = this.toNumber(cells[2]);
-      if (cells[0] && (inr !== null || eur !== null)) {
-        rows.push({ label: cells[0], inr, eur });
+
+    const rowMatches = [...html.matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/gi)];
+    if (rowMatches.length === 0) return [];
+
+    // Determine INR / EUR / label column indices from the header row
+    // (column order differs by country: Poland = INR,EUR ; Austria = EUR,INR)
+    const header = extractCells(rowMatches[0][1]);
+    let inrIdx = header.findIndex((h) => /inr|rupee|₹/i.test(h));
+    let eurIdx = header.findIndex((h) => /eur|euro|€/i.test(h));
+    if (inrIdx === -1 && eurIdx === -1) {
+      // No recognizable header → assume label, INR, EUR
+      inrIdx = 1;
+      eurIdx = 2;
+    } else {
+      if (inrIdx === -1) inrIdx = eurIdx === 1 ? 2 : 1;
+      if (eurIdx === -1) eurIdx = inrIdx === 1 ? 2 : 1;
+    }
+    const labelIdx = [0, 1, 2].find((i) => i !== inrIdx && i !== eurIdx) ?? 0;
+
+    const rows: VfsFeeRow[] = [];
+    for (let r = 1; r < rowMatches.length; r++) {
+      const cells = extractCells(rowMatches[r][1]);
+      if (cells.length < 2) continue;
+      const label = cells[labelIdx];
+      const inr = this.toNumber(cells[inrIdx]);
+      const eur = this.toNumber(cells[eurIdx]);
+      if (label && (inr !== null || eur !== null)) {
+        rows.push({ label, inr, eur });
       }
     }
     return rows;
