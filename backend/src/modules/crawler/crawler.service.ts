@@ -18,6 +18,7 @@ import {
   isSchengenCountry,
 } from './schengen-standard-data';
 import { VfsContentfulService, VfsRouteData } from '../vfs/vfs-contentful.service';
+import { VfsVisaTypeService, VfsVisaType } from '../vfs/vfs-visatype.service';
 
 // ─── ISO alpha-2 → ISO alpha-3 lowercase (VFS URL format) ────────────────────
 // VFS URL pattern: https://visa.vfsglobal.com/{origin3}/en/{dest3}/
@@ -87,6 +88,7 @@ export class CrawlerService {
     private readonly configService: ConfigService,
     private readonly extractionService: ExtractionService,
     private readonly vfsContentful: VfsContentfulService,
+    private readonly vfsVisaTypes: VfsVisaTypeService,
     @InjectQueue(CRAWL_QUEUE_NAME) private readonly crawlQueue: Queue,
   ) {}
 
@@ -189,9 +191,98 @@ export class CrawlerService {
       } else {
         this.logger.warn(`No VFS data and non-Schengen route ${orig}->${dest} — nothing to persist`);
       }
+
+      // ── Per-visa-type data (fees, service charge, checklist PDFs) ──
+      try {
+        const visaTypes = await this.vfsVisaTypes.fetchVisaTypes(orig, dest);
+        if (visaTypes.length > 0) {
+          await this.persistVisaTypes(resolvedRouteId, orig, dest, visaTypes);
+          this.logger.log(`✅ Persisted ${visaTypes.length} visa types for ${orig}->${dest}`);
+        }
+      } catch (e) {
+        this.logger.warn(
+          `Visa-type fetch failed for ${orig}->${dest}: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
     } finally {
       // Always release the in-flight lock so future searches can re-crawl
       this.inFlightCrawls.delete(key);
+    }
+  }
+
+  /**
+   * Persists per-visa-type data (fees, VFS service charge, checklist PDFs)
+   * into visa_types / visa_type_fees, and snapshots fees into visa_fee_history.
+   */
+  private async persistVisaTypes(
+    routeId: string,
+    origin: string,
+    destination: string,
+    visaTypes: VfsVisaType[],
+  ): Promise<void> {
+    const now = new Date().toISOString();
+    const sourceUrl = `https://visa.vfsglobal.com/${(origin || '').toLowerCase()}/en/${(destination || '').toLowerCase()}/visa-type`;
+
+    // Clear previous visa types for this route (cascades to fees/docs)
+    await this.supabase.from('visa_types').delete().eq('route_id', routeId);
+
+    for (let i = 0; i < visaTypes.length; i++) {
+      const vt = visaTypes[i];
+      const { data: inserted, error } = await this.supabase
+        .from('visa_types')
+        .insert({
+          route_id: routeId,
+          category: vt.category,
+          name: vt.name,
+          overview: vt.overview,
+          processing_time: vt.processing_time,
+          photo_specifications: vt.photo_specifications,
+          application_form_url: vt.application_form_url,
+          service_fee: vt.service_fee,
+          service_fee_currency: vt.service_fee_currency,
+          service_fee_note: vt.service_fee_note,
+          checklist_pdf_url: vt.checklist_pdf_url,
+          checklist_name: vt.checklist_name,
+          source_url: sourceUrl,
+          display_order: i,
+          last_verified_at: now,
+          updated_at: now,
+        })
+        .select('id')
+        .single();
+
+      if (error || !inserted) {
+        this.logger.warn(`Failed to insert visa type ${vt.name}: ${error?.message}`);
+        continue;
+      }
+
+      // Fee rows
+      if (vt.fees.length > 0) {
+        await this.supabase.from('visa_type_fees').insert(
+          vt.fees.map((f, idx) => ({
+            visa_type_id: inserted.id,
+            fee_label: f.label,
+            fee_inr: f.inr,
+            fee_eur: f.eur,
+            display_order: idx,
+          })),
+        );
+
+        // Snapshot into fee history (versioning)
+        await this.supabase.from('visa_fee_history').insert(
+          vt.fees.map((f) => ({
+            route_id: routeId,
+            visa_type_name: vt.name,
+            fee_label: f.label,
+            fee_inr: f.inr,
+            fee_eur: f.eur,
+            service_fee: vt.service_fee,
+            service_fee_currency: vt.service_fee_currency,
+            source_url: sourceUrl,
+            captured_at: now,
+          })),
+        );
+      }
     }
   }
 

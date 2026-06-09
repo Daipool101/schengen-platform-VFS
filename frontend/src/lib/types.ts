@@ -65,8 +65,34 @@ export interface VisaExemptInfo {
   notes: string;
 }
 
+export interface VisaTypeFee {
+  fee_label: string;
+  fee_inr: number | null;
+  fee_eur: number | null;
+  display_order: number;
+}
+
+export interface VisaType {
+  id: string;
+  category: string;
+  name: string;
+  overview: string | null;
+  processing_time: string | null;
+  photo_specifications: string | null;
+  application_form_url: string | null;
+  service_fee: number | null;
+  service_fee_currency: string | null;
+  service_fee_note: string | null;
+  checklist_pdf_url: string | null;
+  checklist_name: string | null;
+  source_url: string | null;
+  display_order: number;
+  visa_type_fees: VisaTypeFee[];
+}
+
 export interface RouteSearchResult {
   status?: 'found' | 'stale' | 'pending' | 'visa_exempt';
+  visa_types?: VisaType[];
   route: {
     origin_country: string;
     destination_country: string;

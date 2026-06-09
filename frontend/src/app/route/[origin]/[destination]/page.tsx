@@ -27,6 +27,7 @@ import { searchRoute } from '@/lib/api';
 import { RouteSearchResult, VisaDocument, VacCenter, TravelAdvisory } from '@/lib/types';
 import LoadingState from '@/components/ui/LoadingState';
 import FreshnessIndicator from '@/components/results/FreshnessIndicator';
+import VisaTypesSection from '@/components/results/VisaTypesSection';
 
 const NA = <span className="text-gray-400 italic text-sm">Information not available</span>;
 
@@ -339,7 +340,7 @@ export default function RouteResultsPage() {
     );
   }
 
-  const { route, requirements, documents, vac_centers, advisories, esim, converted_fee } = result;
+  const { route, requirements, documents, vac_centers, advisories, esim, converted_fee, visa_types } = result;
 
   const mandatory = documents
     .filter((d) => d.is_mandatory)
@@ -415,6 +416,13 @@ export default function RouteResultsPage() {
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* LEFT: Main content */}
         <div className="lg:col-span-2 space-y-6">
+          {/* Visa Types & Fees (real VFS data, per visa category) */}
+          {visa_types && visa_types.length > 0 && (
+            <Section title="Visa Types & Fees" icon={<CreditCard className="w-4 h-4" />}>
+              <VisaTypesSection visaTypes={visa_types} />
+            </Section>
+          )}
+
           {/* Section 1 — Visa Overview */}
           <Section title="Visa Overview" icon={<CreditCard className="w-4 h-4" />}>
             {requirements ? (

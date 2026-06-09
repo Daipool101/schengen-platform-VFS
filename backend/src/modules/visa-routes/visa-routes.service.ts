@@ -15,6 +15,7 @@ export interface RouteSearchResult {
   vac_centers?: any[];
   advisories?: any[];
   esim?: any;
+  visa_types?: any[];
   visa_exempt?: VisaExemptInfo;
   meta: {
     origin: string;
@@ -140,6 +141,7 @@ export class VisaRoutesService {
       { data: vac_centers },
       { data: advisories },
       { data: esim },
+      { data: visa_types },
     ] = await Promise.all([
       this.supabase.from('visa_routes').select('*').eq('id', routeId).single(),
       this.supabase.from('visa_requirements').select('*').eq('route_id', routeId).single(),
@@ -165,6 +167,12 @@ export class VisaRoutesService {
         .select('*')
         .eq('destination_country', destination)
         .single(),
+      // Per-visa-type data with nested fee rows (gracefully empty if table absent)
+      this.supabase
+        .from('visa_types')
+        .select('*, visa_type_fees(*)')
+        .eq('route_id', routeId)
+        .order('display_order', { ascending: true }),
     ]);
 
     return {
@@ -174,6 +182,7 @@ export class VisaRoutesService {
       vac_centers: vac_centers ?? [],
       advisories: advisories ?? [],
       esim: esim ?? null,
+      visa_types: visa_types ?? [],
     };
   }
 
