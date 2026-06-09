@@ -194,6 +194,9 @@ export class CrawlerService {
 
       // ── Per-visa-type data (fees, service charge, checklist PDFs) ──
       try {
+        // Brief breather so the heavy onePager call isn't crammed right behind
+        // the VAC/page Contentful calls (avoids same-crawl throttling).
+        await new Promise((r) => setTimeout(r, 2000));
         const visaTypes = await this.vfsVisaTypes.fetchVisaTypes(orig, dest);
         if (visaTypes.length > 0) {
           await this.persistVisaTypes(resolvedRouteId, orig, dest, visaTypes);

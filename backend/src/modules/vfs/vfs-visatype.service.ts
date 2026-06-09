@@ -47,18 +47,34 @@ export class VfsVisaTypeService {
 
     const name = `${dest3} > ${orig3} > en`;
 
-    // Fetch with empty-retries: under load the Contentful endpoint sometimes
-    // throttles and returns an empty array. Retry with increasing backoff.
+    // A complete onePager resolves dozens of linked entries (fee tables, tabs,
+    // assets). Under load, Contentful sometimes returns the entry (total=1) but
+    // with truncated/empty `includes` — so we retry until the response looks
+    // complete, not just non-empty.
+    const isIncomplete = (d: any): boolean => {
+      if (!d || (d.total ?? 0) === 0) return true;
+      const entries = d?.includes?.Entry ?? [];
+      return entries.length < 15;
+    };
+
     let data = await this.query('onePager', { 'fields.name': name, include: '10' });
-    const backoffs = [3000, 6000, 9000];
-    for (let i = 0; data && (data.total ?? 0) === 0 && i < backoffs.length; i++) {
+    const backoffs = [2500, 5000, 8000, 12000];
+    for (let i = 0; isIncomplete(data) && i < backoffs.length; i++) {
       await new Promise((r) => setTimeout(r, backoffs[i]));
       const retry = await this.query('onePager', { 'fields.name': name, include: '10' });
+      if (retry && !isIncomplete(retry)) {
+        data = retry;
+        break;
+      }
       if (retry) data = retry;
     }
+
     if (!data || (data.total ?? 0) === 0) {
       this.logger.log(`No onePager for ${name} — route may not publish visa-type data`);
       return [];
+    }
+    if (isIncomplete(data)) {
+      this.logger.warn(`onePager for ${name} still incomplete after retries — partial data`);
     }
 
     return this.parse(data);

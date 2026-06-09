@@ -1,0 +1,11 @@
+const BASE='https://d2ab400qlgxn2g.cloudfront.net/dev/spaces/xxg4p8gt3sg6/environments/master/entries';
+const TOKEN='5YpTBRikGN59YHwM18CyGr5F43bFuaak9U8FSMEDmb8';
+const u=new URL(BASE);
+u.searchParams.set('content_type','onePager');
+u.searchParams.set('fields.name','aut > ind > en');
+u.searchParams.set('include','10');
+const res=await fetch(u,{headers:{Authorization:'Bearer '+TOKEN,Referer:'https://visa.vfsglobal.com/','Accept-Language':'en-US'}});
+const d=await res.json();
+const e=(d.includes&&d.includes.Entry)||[];
+const t=e.filter(x=>x.fields&&x.fields.table&&/visa fee/i.test(x.fields.table));
+console.log('FROM EC2: HTTP '+res.status+' total='+d.total+' entries='+e.length+' feeTables='+t.length);
