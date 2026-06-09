@@ -138,8 +138,19 @@ export class VfsVisaTypeService {
       (e) => e?.sys?.contentType?.sys?.id === 'visaTypeInformation' &&
         Array.isArray(e?.fields?.visaTypes),
     );
+    // Build a name→fees map from ALL fee-table entries, so dropdown types whose
+    // fee table isn't embedded in visaInformation (e.g. Austria) still get fees.
+    const feesByName: Record<string, VfsFeeRow[]> = {};
+    for (const e of entries) {
+      if (e?.fields?.table && /visa fee/i.test(e.fields.table)) {
+        const nm = this.norm(this.visaTypeFromInternalName(e.fields.internalName || ''));
+        const fees = this.parseHtmlFeeTable(e.fields.table);
+        if (nm && fees.length > 0) feesByName[nm] = fees;
+      }
+    }
+
     if (vti) {
-      const result = this.parseFromDropdown(vti, byId, assetById, pdfs, applicationForm, serviceCharge);
+      const result = this.parseFromDropdown(vti, byId, assetById, pdfs, applicationForm, serviceCharge, feesByName);
       if (result.length > 0) {
         this.logger.log(`Parsed ${result.length} visa types from dropdown`);
         return result;
@@ -189,6 +200,7 @@ export class VfsVisaTypeService {
     pdfs: { title: string; url: string | null }[],
     applicationForm: { title: string; url: string | null } | undefined,
     serviceCharge: { amount: number; currency: string; note: string } | null,
+    feesByName: Record<string, VfsFeeRow[]> = {},
   ): VfsVisaType[] {
     const out: VfsVisaType[] = [];
     let category = 'Schengen Visa';
@@ -207,7 +219,9 @@ export class VfsVisaTypeService {
       // Resolve this type's embedded fee table + application form from visaInformation
       const info = entry.fields?.visaInformation;
       const tableEntry = this.findEmbeddedTable(info, byId);
-      const fees = tableEntry ? this.parseHtmlFeeTable(tableEntry.fields.table) : [];
+      let fees = tableEntry ? this.parseHtmlFeeTable(tableEntry.fields.table) : [];
+      // Fallback: match a fee table by visa-type name (countries that don't embed it)
+      if (fees.length === 0) fees = feesByName[this.norm(name)] ?? [];
       const appUrl = this.findEformsLink(info) ?? applicationForm?.url ?? null;
       const checklist = this.matchChecklist(name, pdfs);
 
