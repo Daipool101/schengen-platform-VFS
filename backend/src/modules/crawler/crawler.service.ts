@@ -215,6 +215,23 @@ export class CrawlerService {
             `✅ Persisted ${visaTypes.length} visa types for ${orig}->${dest} ` +
             `(one-pager: ${onePagerTypes.length}, contentful: ${contentfulTypes.length})`,
           );
+        } else {
+          // Both sources empty. If we have stored types, keep them untouched.
+          // Either way mark the route stale so the daily cron retries it —
+          // an empty result must never count as a successful fresh crawl.
+          const { data: existing } = await this.supabase
+            .from('visa_types')
+            .select('id')
+            .eq('route_id', resolvedRouteId)
+            .limit(1);
+          this.logger.warn(
+            `No visa types from either source for ${orig}->${dest}` +
+            `${existing?.length ? ' — keeping stored data' : ''}; marking stale for retry`,
+          );
+          await this.supabase
+            .from('visa_requirements')
+            .update({ data_freshness_status: 'stale', updated_at: new Date().toISOString() })
+            .eq('route_id', resolvedRouteId);
         }
       } catch (e) {
         this.logger.warn(
@@ -275,6 +292,41 @@ export class CrawlerService {
   ): Promise<void> {
     const now = new Date().toISOString();
     const sourceUrl = `https://visa.vfsglobal.com/${(origin || '').toLowerCase()}/en/${(destination || '').toLowerCase()}/visa-type`;
+
+    // ── QUALITY GATE ─────────────────────────────────────────────────────────
+    // Crawls can be throttled/partial. Never destroy better data with worse:
+    // compare the new result's quality against what's already stored and skip
+    // the destructive replace if the new data is poorer.
+    const newQuality =
+      visaTypes.filter((v) => v.fees.length > 0).length * 10 +
+      visaTypes.length +
+      (visaTypes.some((v) => v.service_fee != null) ? 5 : 0) +
+      (visaTypes.some((v) => v.checklist_pdf_url) ? 3 : 0);
+
+    const { data: existingTypes } = await this.supabase
+      .from('visa_types')
+      .select('id, service_fee, checklist_pdf_url, visa_type_fees(id)')
+      .eq('route_id', routeId);
+
+    if (existingTypes && existingTypes.length > 0) {
+      const oldQuality =
+        existingTypes.filter((e: any) => (e.visa_type_fees ?? []).length > 0).length * 10 +
+        existingTypes.length +
+        (existingTypes.some((e: any) => e.service_fee != null) ? 5 : 0) +
+        (existingTypes.some((e: any) => e.checklist_pdf_url) ? 3 : 0);
+
+      if (newQuality < oldQuality) {
+        this.logger.warn(
+          `Quality gate ${origin}->${destination}: new data (q=${newQuality}) poorer than stored (q=${oldQuality}) — keeping stored, marking stale for retry`,
+        );
+        // Mark stale so the daily cron retries this route
+        await this.supabase
+          .from('visa_requirements')
+          .update({ data_freshness_status: 'stale', updated_at: now })
+          .eq('route_id', routeId);
+        return;
+      }
+    }
 
     // Mirror the VFS service charge into the Visa Overview's Service Fee field
     const svc = visaTypes.find((v) => v.service_fee != null);

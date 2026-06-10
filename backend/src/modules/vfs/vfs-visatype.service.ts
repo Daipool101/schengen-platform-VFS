@@ -385,16 +385,26 @@ export class VfsVisaTypeService {
   private parseServiceCharge(
     text: string,
   ): { amount: number; currency: string; note: string } | null {
-    // e.g. "there is a service charge of INR 1026/-"
-    const m = text.match(/service charge of\s*(INR|EUR|₹)?\s*([\d,]+)/i);
-    if (!m) return null;
-    const amount = this.toNumber(m[2]);
+    // Formats: "service charge of INR 1026/-", "service charge in INR 1855/-",
+    //          "service charge of 19 Euros"
+    let amount: number | null = null;
+    let currency = 'INR';
+    let m = text.match(/service charge\s*(?:of|in)?\s*(INR|EUR|₹)\s*([\d,]+)/i);
+    if (m) {
+      amount = this.toNumber(m[2]);
+      currency = /eur|€/i.test(m[1]) ? 'EUR' : 'INR';
+    } else if ((m = text.match(/service charge\s*(?:of|in)?\s*([\d,]+(?:\.\d+)?)\s*Euros?/i))) {
+      amount = this.toNumber(m[1]);
+      currency = 'EUR';
+    } else if ((m = text.match(/service charge\s*(?:of|in)?\s*([\d,]+)/i))) {
+      amount = this.toNumber(m[1]);
+    }
     if (amount === null) return null;
     const noteMatch = text.match(/[^.]*service charge[^.]*\./i);
     return {
       amount,
-      currency: /eur|€/i.test(m[1] || '') ? 'EUR' : 'INR',
-      note: noteMatch ? noteMatch[0].trim().slice(0, 300) : `Service charge of INR ${amount}`,
+      currency,
+      note: noteMatch ? noteMatch[0].trim().slice(0, 300) : `Service charge of ${currency} ${amount}`,
     };
   }
 

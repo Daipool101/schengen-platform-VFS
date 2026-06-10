@@ -165,17 +165,33 @@ export class VfsOnePagerService {
     html: string,
   ): { amount: number; currency: string; note: string } | null {
     const text = html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ');
-    // e.g. "VFS Service Fee 2109 (Euro 19)"  or  "service charge of INR 1026"
+    // Formats seen across countries:
+    //   "VFS Service Fee 2109 (Euro 19)"            (Denmark — INR table)
+    //   "service charge of INR 1026/-"               (Poland)
+    //   "service charge in INR 1855/-"               (Netherlands)
+    //   "service charge of 19 Euros"                 (Sweden — EUR only)
+    let amount: number | null = null;
+    let currency = 'INR';
+
     let m = text.match(/VFS\s*Service\s*Fee[:\s]*([\d,]+)\s*(?:\(Euro\s*([\d.]+)\))?/i);
-    if (!m) m = text.match(/service charge of\s*(?:INR|₹)?\s*([\d,]+)/i);
-    if (!m) return null;
-    const amount = parseFloat(m[1].replace(/,/g, ''));
-    if (isNaN(amount)) return null;
+    if (m) {
+      amount = parseFloat(m[1].replace(/,/g, ''));
+    } else if ((m = text.match(/service charge\s*(?:of|in)?\s*(?:INR|₹)\s*([\d,]+)/i))) {
+      amount = parseFloat(m[1].replace(/,/g, ''));
+    } else if ((m = text.match(/service charge\s*(?:of|in)?\s*([\d,]+(?:\.\d+)?)\s*Euros?/i))) {
+      amount = parseFloat(m[1].replace(/,/g, ''));
+      currency = 'EUR';
+    } else if ((m = text.match(/service charge\s*(?:of|in)?\s*(?:EUR|€)\s*([\d,]+(?:\.\d+)?)/i))) {
+      amount = parseFloat(m[1].replace(/,/g, ''));
+      currency = 'EUR';
+    }
+
+    if (amount === null || isNaN(amount)) return null;
     const noteMatch = text.match(/[^.]*(?:VFS Service Fee|service charge)[^.]*\./i);
     return {
       amount,
-      currency: 'INR',
-      note: noteMatch ? noteMatch[0].trim().slice(0, 300) : `VFS Service Fee INR ${amount}`,
+      currency,
+      note: noteMatch ? noteMatch[0].trim().slice(0, 300) : `VFS Service Fee ${currency} ${amount}`,
     };
   }
 
