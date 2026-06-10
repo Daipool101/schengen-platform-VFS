@@ -125,40 +125,96 @@ export class VfsOnePagerService {
     return out;
   }
 
-  /** Parses every fee table in a section; returns combined rows. */
+  /**
+   * Parses every fee table in a section, handling the two layouts VFS uses:
+   *   A) Labeled columns — header has "VISA FEES IN INR" / "...IN EUROS" and
+   *      cells are bare numbers (Denmark, Latvia, Austria…).
+   *   B) Inline amounts — no currency columns; each amount sits inside one cell
+   *      as "9900/- INR" / "90 EUR" / "₹9,956" (Bulgaria…).
+   * Document/photo tables are ignored because they never contain a cell that is
+   * *entirely* a currency amount.
+   */
   private parseFeeTables(sectionHtml: string): VfsFeeRow[] {
-    const rows: VfsFeeRow[] = [];
+    const out: VfsFeeRow[] = [];
+
+    const cellsOf = (row: string) =>
+      [...row.matchAll(/<t[dh][^>]*>([\s\S]*?)<\/t[dh]>/gi)].map((c) =>
+        c[1]
+          .replace(/<[^>]+>/g, '')
+          .replace(/&#8364;/g, '€')
+          .replace(/&#8377;/g, '₹')
+          .replace(/&nbsp;/g, ' ')
+          .replace(/\s+/g, ' ')
+          .trim(),
+      );
+
+    // True only when the WHOLE cell is a currency amount (not a sentence and not
+    // a bare row number). The currency marker is REQUIRED — either as a suffix
+    // ("9900/- INR", "90 EUR") or a prefix ("₹9,956", "€90").
+    const amountInCell = (s: string): { amt: number; cur: 'INR' | 'EUR' } | null => {
+      const m =
+        s.match(/^[\s]*([\d][\d,]*(?:\.\d+)?)\s*\/?\s*-?\s*(INR|EUR|Rs\.?|Euros?|Rupees?|₹|€)\s*$/i) ||
+        s.match(/^\s*(Rs\.?|INR|EUR|₹|€)\s*([\d][\d,]*(?:\.\d+)?)\s*\/?\s*-?\s*$/i);
+      if (!m) return null;
+      // First alt: amount in group 1; second alt: amount in group 2
+      const amtStr = /^\d/.test(m[1]) ? m[1] : m[2];
+      const amt = parseFloat(amtStr.replace(/,/g, ''));
+      if (isNaN(amt)) return null;
+      return { amt, cur: /eur|€|euro/i.test(s) ? 'EUR' : 'INR' };
+    };
+
     for (const tbl of sectionHtml.matchAll(/<table[^>]*>([\s\S]*?)<\/table>/gi)) {
-      const tHtml = tbl[1];
-      if (!/visa\s*fee/i.test(tHtml)) continue;
-      const trList = [...tHtml.matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/gi)];
-      if (!trList.length) continue;
-      const cellsOf = (row: string) =>
-        [...row.matchAll(/<t[dh][^>]*>([\s\S]*?)<\/t[dh]>/gi)].map((c) =>
-          c[1].replace(/<[^>]+>/g, '').replace(/&#8364;|€|&nbsp;/g, ' ').replace(/\s+/g, ' ').trim(),
-        );
+      const trList = [...tbl[1].matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/gi)];
+      if (trList.length < 2) continue;
+
       const header = cellsOf(trList[0][1]);
-      let inrIdx = header.findIndex((x) => /inr|rupee/i.test(x));
-      let eurIdx = header.findIndex((x) => /eur/i.test(x));
-      if (inrIdx === -1 && eurIdx === -1) { inrIdx = 1; eurIdx = 2; }
-      else { if (inrIdx === -1) inrIdx = -99; if (eurIdx === -1) eurIdx = -99; }
-      const labelIdx = 0;
-      for (let r = 1; r < trList.length; r++) {
-        const cells = cellsOf(trList[r][1]);
-        if (cells.length < 2) continue;
-        const num = (i: number) => {
-          if (i < 0 || i >= cells.length) return null;
-          const n = parseFloat(cells[i].replace(/[, ]/g, ''));
-          return isNaN(n) ? null : n;
-        };
-        const inr = num(inrIdx);
-        const eur = num(eurIdx);
-        if (cells[labelIdx] && (inr !== null || eur !== null)) {
-          rows.push({ label: cells[labelIdx], inr, eur });
+      let inrIdx = header.findIndex((x) => /inr|rupee|₹/i.test(x));
+      let eurIdx = header.findIndex((x) => /eur|euro|€/i.test(x));
+      const labeled = inrIdx >= 0 || eurIdx >= 0;
+
+      if (labeled) {
+        // ── Branch A: separate INR / EUR columns ──
+        if (inrIdx === -1) inrIdx = -99;
+        if (eurIdx === -1) eurIdx = -99;
+        for (let r = 1; r < trList.length; r++) {
+          const cells = cellsOf(trList[r][1]);
+          if (cells.length < 2) continue;
+          const num = (i: number) => {
+            if (i < 0 || i >= cells.length) return null;
+            const n = parseFloat(cells[i].replace(/[^\d.]/g, ''));
+            return isNaN(n) ? null : n;
+          };
+          const inr = num(inrIdx);
+          const eur = num(eurIdx);
+          if (cells[0] && (inr !== null || eur !== null)) {
+            out.push({ label: cells[0], inr, eur });
+          }
+        }
+      } else {
+        // ── Branch B: amount embedded in a cell with a currency marker ──
+        for (let r = 1; r < trList.length; r++) {
+          const cells = cellsOf(trList[r][1]);
+          if (cells.length < 2) continue;
+          let inr: number | null = null;
+          let eur: number | null = null;
+          for (const c of cells) {
+            const am = amountInCell(c);
+            if (am) {
+              if (am.cur === 'EUR') eur = am.amt;
+              else inr = am.amt;
+            }
+          }
+          if (inr === null && eur === null) continue;
+          // Label = first descriptive cell (not an amount, not a bare row number)
+          const label =
+            cells.find(
+              (c) => c && !amountInCell(c) && !/^\d+\.?$/.test(c) && c.length > 1,
+            ) ?? 'Visa Fee';
+          out.push({ label: label.slice(0, 200), inr, eur });
         }
       }
     }
-    return rows;
+    return out;
   }
 
   private parseServiceCharge(
