@@ -176,7 +176,7 @@ export class VfsOnePagerService {
     let m = text.match(/VFS\s*Service\s*Fee[:\s]*([\d,]+)\s*(?:\(Euro\s*([\d.]+)\))?/i);
     if (m) {
       amount = parseFloat(m[1].replace(/,/g, ''));
-    } else if ((m = text.match(/service charge\s*(?:of|in)?\s*(?:INR|₹)\s*([\d,]+)/i))) {
+    } else if ((m = text.match(/service charge\s*(?:of|in)?\s*(?:INR|₹|Rs\.?)\s*([\d,]+)/i))) {
       amount = parseFloat(m[1].replace(/,/g, ''));
     } else if ((m = text.match(/service charge\s*(?:of|in)?\s*([\d,]+(?:\.\d+)?)\s*Euros?/i))) {
       amount = parseFloat(m[1].replace(/,/g, ''));

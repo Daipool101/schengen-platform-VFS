@@ -47,14 +47,13 @@ export class VfsVisaTypeService {
 
     const name = `${dest3} > ${orig3} > en`;
 
-    // A complete onePager resolves dozens of linked entries (fee tables, tabs,
-    // assets). Under load, Contentful sometimes returns the entry (total=1) but
-    // with truncated/empty `includes` — so we retry until the response looks
-    // complete, not just non-empty.
+    // Contentful sometimes returns the entry (total=1) but with truncated
+    // includes under load. Retry if we get fewer than 3 linked entries —
+    // even a simple page (e.g. Airport Transit) needs at least a fee-table entry.
     const isIncomplete = (d: any): boolean => {
       if (!d || (d.total ?? 0) === 0) return true;
       const entries = d?.includes?.Entry ?? [];
-      return entries.length < 15;
+      return entries.length < 3;
     };
 
     let data = await this.query('onePager', { 'fields.name': name, include: '10' });
@@ -70,14 +69,34 @@ export class VfsVisaTypeService {
     }
 
     if (!data || (data.total ?? 0) === 0) {
-      this.logger.log(`No onePager for ${name} — route may not publish visa-type data`);
-      return [];
-    }
-    if (isIncomplete(data)) {
-      this.logger.warn(`onePager for ${name} still incomplete after retries — partial data`);
+      this.logger.log(`No onePager for ${name} — trying countryPage fallback`);
+    } else {
+      if (isIncomplete(data)) {
+        this.logger.warn(`onePager for ${name} still incomplete after retries — partial data`);
+      }
+      const result = this.parse(data);
+      if (result.length > 0) return result;
+      this.logger.log(`onePager parse yielded 0 types for ${name} — trying countryPage fallback`);
     }
 
-    return this.parse(data);
+    // ── FALLBACK: countryPage content type (same Contentful space, different type) ──
+    // This is the source that powers the VFS SPA. Countries without an onePager
+    // entry (e.g. Latvia's Airport Transit) still have fee tables embedded in their
+    // countryPage includes.
+    try {
+      const cpData = await this.query('countryPage', { 'fields.locale': name, include: '10' });
+      if (cpData && (cpData.total ?? 0) > 0) {
+        const cpResult = this.parse(cpData);
+        if (cpResult.length > 0) {
+          this.logger.log(`countryPage fallback ${name}: ${cpResult.length} visa types`);
+          return cpResult;
+        }
+      }
+    } catch (e) {
+      this.logger.warn(`countryPage fallback failed for ${name}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+
+    return [];
   }
 
   private async query(
@@ -389,7 +408,9 @@ export class VfsVisaTypeService {
     //          "service charge of 19 Euros"
     let amount: number | null = null;
     let currency = 'INR';
-    let m = text.match(/service charge\s*(?:of|in)?\s*(INR|EUR|₹)\s*([\d,]+)/i);
+    // Formats: "service charge of INR 1026/-", "service charge in INR 1855/-",
+    //          "service charge of Rs. 2987/-", "service charge of 19 Euros"
+    let m = text.match(/service charge\s*(?:of|in)?\s*(INR|EUR|₹|Rs\.?)\s*([\d,]+)/i);
     if (m) {
       amount = this.toNumber(m[2]);
       currency = /eur|€/i.test(m[1]) ? 'EUR' : 'INR';

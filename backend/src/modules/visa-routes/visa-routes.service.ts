@@ -193,6 +193,46 @@ export class VisaRoutesService {
     );
   }
 
+  /**
+   * Force a fully fresh crawl for a route. Wipes visa_types so the quality gate
+   * doesn't block the new data, then runs crawlRoute synchronously and returns
+   * the count of visa types that were stored.
+   */
+  async forceRecrawl(origin: string, destination: string): Promise<{ visa_types_count: number }> {
+    // Resolve (or create) the route row
+    const { data: existing } = await this.supabase
+      .from('visa_routes')
+      .select('id')
+      .eq('origin_country', origin)
+      .eq('destination_country', destination)
+      .maybeSingle();
+
+    let routeId: string;
+    if (existing) {
+      routeId = existing.id;
+    } else {
+      const { data: newRoute } = await this.supabase
+        .from('visa_routes')
+        .insert({ origin_country: origin, destination_country: destination, route_status: 'pending' })
+        .select('id')
+        .single();
+      routeId = newRoute!.id;
+    }
+
+    // Wipe visa_types so the quality gate starts fresh (forced recrawl = user intent to refresh)
+    await this.supabase.from('visa_types').delete().eq('route_id', routeId);
+
+    // Run synchronously so we can report the result
+    await this.crawlerService.crawlRoute(origin, destination, routeId);
+
+    const { data: types } = await this.supabase
+      .from('visa_types')
+      .select('id')
+      .eq('route_id', routeId);
+
+    return { visa_types_count: types?.length ?? 0 };
+  }
+
   private isDataStale(lastVerifiedAt: string | null | undefined): boolean {
     if (!lastVerifiedAt) return true;
     const verifiedDate = new Date(lastVerifiedAt);
