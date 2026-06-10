@@ -31,9 +31,6 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-    volumes:
-      - ./backend/src:/app/src   # hot reload in dev
-    command: npm run start:dev
 
   # Next.js Frontend
   frontend:
