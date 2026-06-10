@@ -19,6 +19,7 @@ import {
 } from './schengen-standard-data';
 import { VfsContentfulService, VfsRouteData } from '../vfs/vfs-contentful.service';
 import { VfsVisaTypeService, VfsVisaType } from '../vfs/vfs-visatype.service';
+import { VfsOnePagerService } from '../vfs/vfs-onepager.service';
 
 // ─── ISO alpha-2 → ISO alpha-3 lowercase (VFS URL format) ────────────────────
 // VFS URL pattern: https://visa.vfsglobal.com/{origin3}/en/{dest3}/
@@ -89,6 +90,7 @@ export class CrawlerService {
     private readonly extractionService: ExtractionService,
     private readonly vfsContentful: VfsContentfulService,
     private readonly vfsVisaTypes: VfsVisaTypeService,
+    private readonly vfsOnePager: VfsOnePagerService,
     @InjectQueue(CRAWL_QUEUE_NAME) private readonly crawlQueue: Queue,
   ) {}
 
@@ -193,14 +195,26 @@ export class CrawlerService {
       }
 
       // ── Per-visa-type data (fees, service charge, checklist PDFs) ──
+      // Two independent VFS sources, fetched and merged:
+      //   1. Static one-pager pages (plain HTML, most reliable, most countries)
+      //   2. Contentful onePager entries (SPA data source)
       try {
-        // Brief breather so the heavy onePager call isn't crammed right behind
-        // the VAC/page Contentful calls (avoids same-crawl throttling).
         await new Promise((r) => setTimeout(r, 2000));
-        const visaTypes = await this.vfsVisaTypes.fetchVisaTypes(orig, dest);
+
+        const [opRes, cfRes] = await Promise.allSettled([
+          this.vfsOnePager.fetchVisaTypes(orig, dest),
+          this.vfsVisaTypes.fetchVisaTypes(orig, dest),
+        ]);
+        const onePagerTypes = opRes.status === 'fulfilled' ? opRes.value : [];
+        const contentfulTypes = cfRes.status === 'fulfilled' ? cfRes.value : [];
+
+        const visaTypes = this.mergeVisaTypeSources(onePagerTypes, contentfulTypes);
         if (visaTypes.length > 0) {
           await this.persistVisaTypes(resolvedRouteId, orig, dest, visaTypes);
-          this.logger.log(`✅ Persisted ${visaTypes.length} visa types for ${orig}->${dest}`);
+          this.logger.log(
+            `✅ Persisted ${visaTypes.length} visa types for ${orig}->${dest} ` +
+            `(one-pager: ${onePagerTypes.length}, contentful: ${contentfulTypes.length})`,
+          );
         }
       } catch (e) {
         this.logger.warn(
@@ -211,6 +225,42 @@ export class CrawlerService {
       // Always release the in-flight lock so future searches can re-crawl
       this.inFlightCrawls.delete(key);
     }
+  }
+
+  /**
+   * Merges visa types from the two VFS sources. The richer source (more types
+   * with actual fee rows, then more types overall) becomes the base; gaps in
+   * service fee / processing time / checklist are filled from the other.
+   */
+  private mergeVisaTypeSources(a: VfsVisaType[], b: VfsVisaType[]): VfsVisaType[] {
+    const score = (list: VfsVisaType[]) =>
+      list.filter((v) => v.fees.length > 0).length * 10 + list.length;
+    const base = score(a) >= score(b) ? a : b;
+    const other = base === a ? b : a;
+    if (base.length === 0) return other;
+
+    const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const fallbackSvc = other.find((v) => v.service_fee != null);
+
+    return base.map((v) => {
+      const match = other.find(
+        (o) => norm(o.name) === norm(v.name) ||
+          norm(o.name).includes(norm(v.name)) ||
+          norm(v.name).includes(norm(o.name)),
+      );
+      return {
+        ...v,
+        fees: v.fees.length ? v.fees : match?.fees ?? [],
+        service_fee: v.service_fee ?? match?.service_fee ?? fallbackSvc?.service_fee ?? null,
+        service_fee_currency:
+          v.service_fee_currency ?? match?.service_fee_currency ?? fallbackSvc?.service_fee_currency ?? null,
+        service_fee_note: v.service_fee_note ?? match?.service_fee_note ?? fallbackSvc?.service_fee_note ?? null,
+        checklist_pdf_url: v.checklist_pdf_url ?? match?.checklist_pdf_url ?? null,
+        checklist_name: v.checklist_name ?? match?.checklist_name ?? null,
+        application_form_url: v.application_form_url ?? match?.application_form_url ?? null,
+        processing_time: v.processing_time ?? match?.processing_time ?? null,
+      };
+    });
   }
 
   /**
