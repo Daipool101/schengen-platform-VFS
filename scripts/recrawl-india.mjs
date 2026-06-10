@@ -13,9 +13,9 @@ const API = 'http://16.171.33.99/api';
 const ADMIN_KEY = process.env.ADMIN_SECRET ?? 'vfs-admin';
 
 const SCHENGEN = [
-  'AT','BE','HR','CZ','DK','EE','FI','FR','DE','GR',
+  'AT','BE','BG','HR','CZ','DK','EE','FI','FR','DE','GR',
   'HU','IS','IT','LV','LI','LT','LU','MT','NL','NO',
-  'PL','PT','SK','SI','ES','SE','CH',
+  'PL','PT','RO','SK','SI','ES','SE','CH',
 ];
 
 const headers = { apikey: KEY, Authorization: `Bearer ${KEY}`, 'Content-Type': 'application/json' };

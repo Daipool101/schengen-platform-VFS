@@ -1,7 +1,7 @@
 /**
  * Standard Schengen Short-Stay (Type C) Visa Knowledge Base
  * ---------------------------------------------------------
- * All 27 Schengen countries share the SAME standardized short-stay visa rules
+ * All 29 Schengen countries share the SAME standardized short-stay visa rules
  * (set by EU Regulation (EC) No 810/2009 — the Visa Code). This is authoritative,
  * real-world data used as the reliable baseline, since VFS Global's JavaScript SPA
  * does not expose fees/documents in scrapable HTML.
@@ -95,10 +95,11 @@ export const SCHENGEN_STANDARD_DOCUMENTS: StandardDocument[] = [
 ];
 
 // ─── Schengen member countries (ISO alpha-2) ─────────────────────────────────
+// 29 members: the original 27 + Bulgaria & Romania (full Schengen since Jan 2025).
 export const SCHENGEN_COUNTRY_CODES = new Set<string>([
-  'AT', 'BE', 'HR', 'CZ', 'DK', 'EE', 'FI', 'FR', 'DE', 'GR',
+  'AT', 'BE', 'BG', 'HR', 'CZ', 'DK', 'EE', 'FI', 'FR', 'DE', 'GR',
   'HU', 'IS', 'IT', 'LV', 'LI', 'LT', 'LU', 'MT', 'NL', 'NO',
-  'PL', 'PT', 'SK', 'SI', 'ES', 'SE', 'CH',
+  'PL', 'PT', 'RO', 'SK', 'SI', 'ES', 'SE', 'CH',
 ]);
 
 export function isSchengenCountry(countryCode: string): boolean {

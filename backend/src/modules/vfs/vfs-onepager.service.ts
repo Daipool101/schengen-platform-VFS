@@ -4,12 +4,12 @@ import { VfsVisaType, VfsFeeRow } from './vfs-visatype.service';
 
 // ISO alpha-2 → VFS one-pager country slug (lowercase full name)
 const ISO2_TO_SLUG: Record<string, string> = {
-  AT: 'austria', BE: 'belgium', HR: 'croatia', CZ: 'czech-republic',
+  AT: 'austria', BE: 'belgium', BG: 'bulgaria', HR: 'croatia', CZ: 'czech-republic',
   DK: 'denmark', EE: 'estonia', FI: 'finland', FR: 'france',
   DE: 'germany', GR: 'greece', HU: 'hungary', IS: 'iceland',
   IT: 'italy', LV: 'latvia', LI: 'liechtenstein', LT: 'lithuania',
   LU: 'luxembourg', MT: 'malta', NL: 'netherlands', NO: 'norway',
-  PL: 'poland', PT: 'portugal', SK: 'slovakia', SI: 'slovenia',
+  PL: 'poland', PT: 'portugal', RO: 'romania', SK: 'slovakia', SI: 'slovenia',
   ES: 'spain', SE: 'sweden', CH: 'switzerland', IN: 'india',
 };
 

@@ -53,11 +53,11 @@ const ISO2_TO_ISO3: Record<string, string> = {
 
 // Schengen country full names for aggregator URL construction
 const SCHENGEN_COUNTRY_NAMES: Record<string, string> = {
-  AT:'austria', BE:'belgium', HR:'croatia', CZ:'czechia', DK:'denmark',
+  AT:'austria', BE:'belgium', BG:'bulgaria', HR:'croatia', CZ:'czechia', DK:'denmark',
   EE:'estonia', FI:'finland', FR:'france', DE:'germany', GR:'greece',
   HU:'hungary', IS:'iceland', IT:'italy', LV:'latvia', LI:'liechtenstein',
   LT:'lithuania', LU:'luxembourg', MT:'malta', NL:'netherlands', NO:'norway',
-  PL:'poland', PT:'portugal', SK:'slovakia', SI:'slovenia', ES:'spain',
+  PL:'poland', PT:'portugal', RO:'romania', SK:'slovakia', SI:'slovenia', ES:'spain',
   SE:'sweden', CH:'switzerland',
 };
 
