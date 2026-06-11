@@ -313,6 +313,39 @@ visa-type dropdown but **no per-type fee tables**, so it shows visa types + the 
 but no per-type fees (that's all VFS publishes for it). More aliases can be added to the map
 if other routes surface the same quirk.
 
+### Clearing up two common misconceptions about this fix
+
+**Misconception 1: "We removed country codes."** No — we still use codes. The FROM/TO
+tags *are* country codes (`sourceCountry=ind`, `targetCountry=lva`). What changed is *how*
+we search with them:
+
+| | Old way | New way |
+|---|---|---|
+| What we send | one glued string `"lva > ind > en"` | two separate tags `sourceCountry=ind`, `targetCountry=lva` |
+| Match type | **exact** (whole label must match) | **field-based** (works even if the label is blank/odd) |
+
+The codes never went away — we stopped gluing them into one fragile label and started
+using them as two separate, reliable filters.
+
+**Misconception 2: "We get a URL, then go scrape it."** No — it's **one call, not two**.
+The structured query both *finds* the entry and *delivers* all its data in the same
+response (because we pass `include=10`):
+
+```
+Ask:    "entry where FROM=ind, TO=lva, en — AND include all its linked data"
+Reply:  the matching entry + ALL its visa data (fees, types, PDFs) in ONE response
+```
+
+There's no second step, no URL we extract and re-fetch. The JSON that returns already
+contains everything; we just read it. (Also: the FROM/TO tags aren't on the *visible* VFS
+web page — they're fields inside the Contentful backend entry the page pulls from.)
+
+**One-paragraph version:** Instead of guessing one exact label like `lva > ind > en`
+(which VFS sometimes didn't write), we ask Contentful "find the entry tagged FROM=India,
+TO=Latvia, in English, and send me all its linked data." It returns the matching entry
+with all the visa data in a single response. Codes stay — they're just the two search tags
+now, not a glued string — and find + fetch happen together in one call.
+
 ---
 
 ## Reference: the per-route data flow
