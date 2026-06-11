@@ -291,6 +291,28 @@ because their folders have both a label *and* the tags.
 **17 fee tables** + the visa-type dropdown (sample row: `C Schengen → ₹9,630 / €90`). So the
 data was always present; only the lookup was wrong.
 
+### Result after deploying (recovered countries)
+
+| Route | Before | After | Notes |
+|---|---|---|---|
+| IN→IT | 0 | **21 types** (18 with fees) | full recovery |
+| IN→IS | 0 | **5 types** (5 with fees) | full recovery |
+| IN→DE | 0 | **3 types** (2 with fees) | recovered |
+| IN→BE | 0 | **2 types** (2 with fees) | recovered |
+| IN→FR | 0 | **1 type** (0 fees) | see code-alias note below |
+
+Regression check passed: LV (12), BG (8), DK (8) unchanged.
+
+### Edge case: non-standard VFS target codes (France)
+
+France was *still* 0 after the structured fix — because VFS files France-from-India under
+its **own sub-code `frp`**, not the ISO3 `fra` (`fra<-ind` = 0 entries; `frp<-ind` = 1).
+Added a `VFS_TARGET_ALIASES` map (`fra → frp`); Attempt 2 tries the standard ISO3 first,
+then known aliases. France is the only Schengen country needing this; its onePager has the
+visa-type dropdown but **no per-type fee tables**, so it shows visa types + the €90 overview
+but no per-type fees (that's all VFS publishes for it). More aliases can be added to the map
+if other routes surface the same quirk.
+
 ---
 
 ## Reference: the per-route data flow
