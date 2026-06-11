@@ -47,42 +47,38 @@ export class VfsVisaTypeService {
 
     const name = `${dest3} > ${orig3} > en`;
 
-    // Contentful sometimes returns the entry (total=1) but with truncated
-    // includes under load. Retry if we get fewer than 3 linked entries —
-    // even a simple page (e.g. Airport Transit) needs at least a fee-table entry.
-    const isIncomplete = (d: any): boolean => {
-      if (!d || (d.total ?? 0) === 0) return true;
-      const entries = d?.includes?.Entry ?? [];
-      return entries.length < 3;
-    };
-
-    let data = await this.query('onePager', { 'fields.name': name, include: '10' });
-    const backoffs = [2500, 5000, 8000, 12000];
-    for (let i = 0; isIncomplete(data) && i < backoffs.length; i++) {
-      await new Promise((r) => setTimeout(r, backoffs[i]));
-      const retry = await this.query('onePager', { 'fields.name': name, include: '10' });
-      if (retry && !isIncomplete(retry)) {
-        data = retry;
-        break;
-      }
-      if (retry) data = retry;
-    }
-
-    if (!data || (data.total ?? 0) === 0) {
-      this.logger.log(`No onePager for ${name} — trying countryPage fallback`);
-    } else {
-      if (isIncomplete(data)) {
-        this.logger.warn(`onePager for ${name} still incomplete after retries — partial data`);
-      }
+    // ── ATTEMPT 1: exact `name` match (fast path) ──
+    // Works for the ~20 countries whose onePager `name` follows the clean
+    // "{dest} > {orig} > en" format (Latvia, Bulgaria, Denmark, …).
+    let data = await this.fetchOnePagerWithRetry({ 'fields.name': name });
+    if (data && (data.total ?? 0) > 0) {
       const result = this.parse(data);
       if (result.length > 0) return result;
-      this.logger.log(`onePager parse yielded 0 types for ${name} — trying countryPage fallback`);
     }
 
-    // ── FALLBACK: countryPage content type (same Contentful space, different type) ──
-    // This is the source that powers the VFS SPA. Countries without an onePager
-    // entry (e.g. Latvia's Airport Transit) still have fee tables embedded in their
-    // countryPage includes.
+    // ── ATTEMPT 2: structured-field lookup (discover, don't guess) ──
+    // Many routes (Italy, France, Germany, Belgium, Iceland…) store the onePager
+    // with a NULL or non-standard `name` (e.g. "ita > ind > it > bangalore"), so
+    // the exact-name match above finds nothing. But every entry reliably carries
+    // sourceCountry / targetCountry / language fields — look it up by those.
+    this.logger.log(`name-match empty for ${name} — trying sourceCountry/targetCountry lookup`);
+    data = await this.fetchOnePagerWithRetry({
+      'fields.sourceCountry': orig3,
+      'fields.targetCountry': dest3,
+      'fields.language': 'en',
+      limit: '1',
+    });
+    if (data && (data.total ?? 0) > 0) {
+      const result = this.parse(data);
+      if (result.length > 0) {
+        this.logger.log(`structured-field lookup ${dest3}<-${orig3}: ${result.length} visa types`);
+        return result;
+      }
+    }
+
+    // ── ATTEMPT 3: countryPage content type (same space, different type) ──
+    // Last resort for routes with no usable onePager at all.
+    this.logger.log(`onePager empty for ${name} — trying countryPage fallback`);
     try {
       const cpData = await this.query('countryPage', { 'fields.locale': name, include: '10' });
       if (cpData && (cpData.total ?? 0) > 0) {
@@ -97,6 +93,37 @@ export class VfsVisaTypeService {
     }
 
     return [];
+  }
+
+  /**
+   * Queries the onePager content type with include=10 and retries until the
+   * linked entries look complete. Contentful sometimes returns the entry
+   * (total>0) but with truncated includes under load, so we retry with backoff
+   * until we have at least a few linked boxes (a real page always has a
+   * fee-table entry + the visa-type dropdown).
+   */
+  private async fetchOnePagerWithRetry(
+    params: Record<string, string>,
+  ): Promise<any | null> {
+    const isIncomplete = (d: any): boolean => {
+      if (!d || (d.total ?? 0) === 0) return true;
+      const entries = d?.includes?.Entry ?? [];
+      return entries.length < 3;
+    };
+
+    const q = { ...params, include: '10' };
+    let data = await this.query('onePager', q);
+    const backoffs = [2500, 5000, 8000, 12000];
+    for (let i = 0; isIncomplete(data) && i < backoffs.length; i++) {
+      await new Promise((r) => setTimeout(r, backoffs[i]));
+      const retry = await this.query('onePager', q);
+      if (retry && !isIncomplete(retry)) {
+        data = retry;
+        break;
+      }
+      if (retry) data = retry;
+    }
+    return data;
   }
 
   private async query(
