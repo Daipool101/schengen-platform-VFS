@@ -4,6 +4,13 @@ import axios from 'axios';
 import { ISO2_TO_ISO3 } from '../../common/iso-codes';
 import { VfsTokenService } from './vfs-token.service';
 
+// VFS sometimes files a destination under its own internal sub-code instead of
+// the ISO-3166 alpha-3. Known Schengen case: France (from India) lives under
+// "frp", not "fra". When the standard code finds nothing, we also try these.
+const VFS_TARGET_ALIASES: Record<string, string[]> = {
+  fra: ['frp'], // France
+};
+
 export interface VfsFeeRow {
   label: string;
   inr: number | null;
@@ -57,22 +64,27 @@ export class VfsVisaTypeService {
     }
 
     // ── ATTEMPT 2: structured-field lookup (discover, don't guess) ──
-    // Many routes (Italy, France, Germany, Belgium, Iceland…) store the onePager
-    // with a NULL or non-standard `name` (e.g. "ita > ind > it > bangalore"), so
-    // the exact-name match above finds nothing. But every entry reliably carries
+    // Many routes (Italy, Germany, Belgium, Iceland…) store the onePager with a
+    // NULL or non-standard `name` (e.g. "ita > ind > it > bangalore"), so the
+    // exact-name match above finds nothing. But every entry reliably carries
     // sourceCountry / targetCountry / language fields — look it up by those.
-    this.logger.log(`name-match empty for ${name} — trying sourceCountry/targetCountry lookup`);
-    data = await this.fetchOnePagerWithRetry({
-      'fields.sourceCountry': orig3,
-      'fields.targetCountry': dest3,
-      'fields.language': 'en',
-      limit: '1',
-    });
-    if (data && (data.total ?? 0) > 0) {
-      const result = this.parse(data);
-      if (result.length > 0) {
-        this.logger.log(`structured-field lookup ${dest3}<-${orig3}: ${result.length} visa types`);
-        return result;
+    // Some destinations use a VFS sub-code (France → "frp"), so we try the
+    // standard ISO3 first, then any known aliases.
+    const targetCodes = [dest3, ...(VFS_TARGET_ALIASES[dest3] ?? [])];
+    for (const target of targetCodes) {
+      this.logger.log(`name-match empty for ${name} — structured lookup ${target}<-${orig3}`);
+      data = await this.fetchOnePagerWithRetry({
+        'fields.sourceCountry': orig3,
+        'fields.targetCountry': target,
+        'fields.language': 'en',
+        limit: '1',
+      });
+      if (data && (data.total ?? 0) > 0) {
+        const result = this.parse(data);
+        if (result.length > 0) {
+          this.logger.log(`structured-field lookup ${target}<-${orig3}: ${result.length} visa types`);
+          return result;
+        }
       }
     }
 
