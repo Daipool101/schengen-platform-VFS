@@ -357,7 +357,18 @@ export class CrawlerService {
     // ~10s), leaving a long window where the API returned a PARTIAL list — so a
     // page load mid-crawl showed only the first 1-2 visa types. Batching the
     // inserts shrinks that window to a few milliseconds.
-    const typeRows = visaTypes.map((vt, i) => ({
+    // Dedupe by (category, name): VFS sometimes lists the same type twice, which
+    // would violate the UNIQUE(route_id, category, name) constraint and make the
+    // single batch insert fail entirely (all-or-nothing). Keep first occurrence.
+    const seenKey = new Set<string>();
+    const uniqueTypes = visaTypes.filter((vt) => {
+      const k = `${(vt.category ?? '').toLowerCase().trim()}|${(vt.name ?? '').toLowerCase().trim()}`;
+      if (seenKey.has(k)) return false;
+      seenKey.add(k);
+      return true;
+    });
+
+    const typeRows = uniqueTypes.map((vt, i) => ({
       route_id: routeId,
       category: vt.category,
       name: vt.name,
@@ -396,7 +407,7 @@ export class CrawlerService {
     // Collect all fee + history rows, then batch-insert each table in ONE call.
     const feeRows: any[] = [];
     const historyRows: any[] = [];
-    visaTypes.forEach((vt, i) => {
+    uniqueTypes.forEach((vt, i) => {
       const id = idByOrder.get(i);
       if (!id || vt.fees.length === 0) return;
       vt.fees.forEach((f, idx) => {
@@ -544,12 +555,20 @@ export class CrawlerService {
     const now = new Date().toISOString();
 
     const [{ data: existingReq }, { data: existingTypes }] = await Promise.all([
-      this.supabase.from('visa_requirements').select('id').eq('route_id', routeId).maybeSingle(),
+      this.supabase
+        .from('visa_requirements')
+        .select('id, confidence_level')
+        .eq('route_id', routeId)
+        .maybeSingle(),
       this.supabase.from('visa_types').select('id').eq('route_id', routeId).limit(1),
     ]);
 
-    if (existingReq || (existingTypes && existingTypes.length > 0)) {
-      // Prior data exists — don't downgrade; mark stale so the cron retries.
+    const hasRealData =
+      (existingTypes && existingTypes.length > 0) ||
+      (existingReq && existingReq.confidence_level === 'high');
+
+    if (hasRealData) {
+      // Genuine prior VFS data — don't downgrade; mark stale so the cron retries.
       await this.supabase
         .from('visa_requirements')
         .update({ data_freshness_status: 'stale', updated_at: now })
@@ -558,11 +577,17 @@ export class CrawlerService {
       return;
     }
 
+    // No real VFS data. Clear any legacy fallback row (confidence 'medium' from
+    // the old seeded baseline) so the page shows a clean "not supported" state.
+    if (existingReq) {
+      await this.supabase.from('visa_requirements').delete().eq('route_id', routeId);
+      await this.supabase.from('visa_documents').delete().eq('route_id', routeId);
+    }
     await this.supabase
       .from('visa_routes')
       .update({ route_status: 'unsupported', application_center: null, updated_at: now })
       .eq('id', routeId);
-    this.logger.log(`No VFS data for ${origin}->${destination} — marked route unsupported (Phase 2)`);
+    this.logger.log(`No VFS data for ${origin}->${destination} — cleared fallback, marked unsupported (Phase 2)`);
   }
 
   // ─── URL Strategy ────────────────────────────────────────────────────────────
