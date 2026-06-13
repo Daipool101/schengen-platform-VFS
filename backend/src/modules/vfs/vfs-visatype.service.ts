@@ -443,21 +443,27 @@ export class VfsVisaTypeService {
   private parseServiceCharge(
     text: string,
   ): { amount: number; currency: string; note: string } | null {
-    // Formats: "service charge of INR 1026/-", "service charge in INR 1855/-",
-    //          "service charge of 19 Euros"
+    // The amount can sit right after the keyword ("service charge of INR 1026")
+    // OR be separated from it by a parenthetical, e.g. Italy:
+    //   "VFS Service Charge (inclusive of GST –SGST @9% and CGST@9%), of INR 631"
+    // So we allow a bounded gap between "service charge" and the amount and take
+    // the FIRST currency amount that follows. Ordered INR-first, then EUR.
+    const GAP = '[\\s\\S]{0,160}?';
+    const attempts: Array<{ re: RegExp; cur: string }> = [
+      { re: new RegExp(`service charge${GAP}(?:INR|Rs\\.?|₹)\\s*([\\d,]+)`, 'i'), cur: 'INR' },
+      { re: new RegExp(`service charge${GAP}([\\d,]+)\\s*/?-?\\s*(?:INR|Rs\\.?|₹|rupees?)`, 'i'), cur: 'INR' },
+      { re: new RegExp(`service charge${GAP}(?:EUR|€)\\s*([\\d.,]+)`, 'i'), cur: 'EUR' },
+      { re: new RegExp(`service charge${GAP}([\\d.,]+)\\s*Euros?`, 'i'), cur: 'EUR' },
+    ];
     let amount: number | null = null;
     let currency = 'INR';
-    // Formats: "service charge of INR 1026/-", "service charge in INR 1855/-",
-    //          "service charge of Rs. 2987/-", "service charge of 19 Euros"
-    let m = text.match(/service charge\s*(?:of|in)?\s*(INR|EUR|₹|Rs\.?)\s*([\d,]+)/i);
-    if (m) {
-      amount = this.toNumber(m[2]);
-      currency = /eur|€/i.test(m[1]) ? 'EUR' : 'INR';
-    } else if ((m = text.match(/service charge\s*(?:of|in)?\s*([\d,]+(?:\.\d+)?)\s*Euros?/i))) {
-      amount = this.toNumber(m[1]);
-      currency = 'EUR';
-    } else if ((m = text.match(/service charge\s*(?:of|in)?\s*([\d,]+)/i))) {
-      amount = this.toNumber(m[1]);
+    for (const a of attempts) {
+      const m = text.match(a.re);
+      if (m) {
+        amount = this.toNumber(m[1]);
+        currency = a.cur;
+        break;
+      }
     }
     if (amount === null) return null;
     const noteMatch = text.match(/[^.]*service charge[^.]*\./i);

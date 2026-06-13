@@ -226,20 +226,32 @@ export class VfsOnePagerService {
     //   "service charge of INR 1026/-"               (Poland)
     //   "service charge in INR 1855/-"               (Netherlands)
     //   "service charge of 19 Euros"                 (Sweden — EUR only)
+    //   "VFS Service Charge (incl. GST ...), of INR 631"  (Italy — gap before amount)
     let amount: number | null = null;
     let currency = 'INR';
 
+    // Denmark's distinct "VFS Service Fee 2109 (Euro 19)" format first.
     let m = text.match(/VFS\s*Service\s*Fee[:\s]*([\d,]+)\s*(?:\(Euro\s*([\d.]+)\))?/i);
     if (m) {
       amount = parseFloat(m[1].replace(/,/g, ''));
-    } else if ((m = text.match(/service charge\s*(?:of|in)?\s*(?:INR|₹|Rs\.?)\s*([\d,]+)/i))) {
-      amount = parseFloat(m[1].replace(/,/g, ''));
-    } else if ((m = text.match(/service charge\s*(?:of|in)?\s*([\d,]+(?:\.\d+)?)\s*Euros?/i))) {
-      amount = parseFloat(m[1].replace(/,/g, ''));
-      currency = 'EUR';
-    } else if ((m = text.match(/service charge\s*(?:of|in)?\s*(?:EUR|€)\s*([\d,]+(?:\.\d+)?)/i))) {
-      amount = parseFloat(m[1].replace(/,/g, ''));
-      currency = 'EUR';
+    } else {
+      // Allow a bounded gap between "service charge" and the amount, so a
+      // parenthetical (e.g. Italy's GST note) between them doesn't hide it.
+      const GAP = '[\\s\\S]{0,160}?';
+      const attempts: Array<{ re: RegExp; cur: string }> = [
+        { re: new RegExp(`service charge${GAP}(?:INR|Rs\\.?|₹)\\s*([\\d,]+)`, 'i'), cur: 'INR' },
+        { re: new RegExp(`service charge${GAP}([\\d,]+)\\s*/?-?\\s*(?:INR|Rs\\.?|₹|rupees?)`, 'i'), cur: 'INR' },
+        { re: new RegExp(`service charge${GAP}(?:EUR|€)\\s*([\\d.,]+)`, 'i'), cur: 'EUR' },
+        { re: new RegExp(`service charge${GAP}([\\d.,]+)\\s*Euros?`, 'i'), cur: 'EUR' },
+      ];
+      for (const a of attempts) {
+        const mm = text.match(a.re);
+        if (mm) {
+          amount = parseFloat(mm[1].replace(/,/g, ''));
+          currency = a.cur;
+          break;
+        }
+      }
     }
 
     if (amount === null || isNaN(amount)) return null;
