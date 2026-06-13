@@ -203,13 +203,18 @@ export default function RouteResultsPage() {
 
             if (routeResp.status === 200) {
               const data = routeResp.data as RouteSearchResult;
-              // Only stop polling once we actually have requirements data
-              if (data.requirements) {
+              // Stop polling once the crawl resolves to a terminal state:
+              // got data, visa-exempt, or confirmed unsupported by VFS.
+              if (
+                data.requirements ||
+                data.status === 'unsupported' ||
+                data.status === 'visa_exempt'
+              ) {
                 clearInterval(poll);
                 setResult(data);
                 setLoading(false);
               }
-              // requirements is null → route row exists but crawl not done yet, keep polling
+              // otherwise route row exists but crawl not done yet → keep polling
             }
             // 202 → still pending, keep polling
           } catch {
@@ -339,6 +344,39 @@ export default function RouteResultsPage() {
     );
   }
 
+  // ── Route not supported by VFS → clear message (no fabricated data) ──
+  if (result.status === 'unsupported') {
+    return (
+      <div className="max-w-2xl mx-auto px-4 py-16">
+        <nav className="flex items-center gap-1 text-sm text-gray-500 mb-5">
+          <Link href="/" className="hover:text-vfs-red transition-colors">Home</Link>
+          <ChevronRight className="w-3.5 h-3.5" />
+          <span className="text-vfs-text font-medium">{origin} → {destination}</span>
+        </nav>
+        <div className="bg-white rounded-xl border border-vfs-border shadow p-8 text-center">
+          <div className="w-16 h-16 rounded-full bg-amber-100 flex items-center justify-center mx-auto mb-4">
+            <Info className="w-8 h-8 text-amber-600" />
+          </div>
+          <h2 className="text-xl font-bold text-vfs-text mb-2">Not available on VFS Global</h2>
+          <p className="text-gray-600 text-sm max-w-md mx-auto mb-2">
+            VFS Global does not publish visa information for{' '}
+            <strong>{origin} → {destination}</strong>.
+          </p>
+          <p className="text-gray-500 text-xs max-w-md mx-auto mb-6">
+            This route may be handled directly by the embassy/consulate or a government
+            portal. Support for those sources is planned for a later phase.
+          </p>
+          <Link
+            href="/"
+            className="inline-flex items-center gap-2 bg-vfs-red text-white px-5 py-2.5 rounded-lg text-sm font-semibold hover:bg-red-700 transition-colors"
+          >
+            ← Search Another Route
+          </Link>
+        </div>
+      </div>
+    );
+  }
+
   const { route, requirements, documents, vac_centers, advisories, converted_fee, visa_types } = result;
 
   const mandatory = documents
@@ -395,11 +433,13 @@ export default function RouteResultsPage() {
                 {route.application_center || 'VFS Global'}
               </span>
 
-              {/* Visa category */}
-              <span className="inline-flex items-center gap-1.5 bg-white/10 border border-white/20 px-3 py-1 rounded-full text-xs font-medium">
-                <CreditCard className="w-3.5 h-3.5" />
-                {route.visa_category || 'Schengen Short Stay C'}
-              </span>
+              {/* Visa category — only shown when VFS provides one */}
+              {route.visa_category && (
+                <span className="inline-flex items-center gap-1.5 bg-white/10 border border-white/20 px-3 py-1 rounded-full text-xs font-medium">
+                  <CreditCard className="w-3.5 h-3.5" />
+                  {route.visa_category}
+                </span>
+              )}
             </div>
           </div>
 
@@ -555,7 +595,11 @@ export default function RouteResultsPage() {
                     <Shield className="w-4 h-4 text-vfs-red" />
                     <span className="text-sm font-semibold text-vfs-text">Travel Insurance</span>
                   </div>
-                  {requirements ? (
+                  {!requirements || requirements.insurance_required === null ? (
+                    <span className="px-2 py-0.5 rounded-full text-xs font-semibold border bg-gray-50 text-gray-500 border-gray-200">
+                      Not specified
+                    </span>
+                  ) : (
                     <span
                       className={`px-2 py-0.5 rounded-full text-xs font-semibold border ${
                         requirements.insurance_required
@@ -565,14 +609,16 @@ export default function RouteResultsPage() {
                     >
                       {requirements.insurance_required ? 'Required' : 'Not Required'}
                     </span>
-                  ) : NA}
+                  )}
                 </div>
                 <p className="text-xs text-gray-500">
                   {requirements?.insurance_required && requirements?.insurance_min_coverage
                     ? `Minimum coverage: €${requirements.insurance_min_coverage.toLocaleString()}`
                     : requirements?.insurance_required
                     ? 'Minimum coverage amount not specified'
-                    : 'No travel insurance requirement'}
+                    : requirements?.insurance_required === false
+                    ? 'No travel insurance requirement'
+                    : 'Not published by VFS for this route'}
                 </p>
               </div>
 
@@ -583,7 +629,11 @@ export default function RouteResultsPage() {
                     <Syringe className="w-4 h-4 text-vfs-red" />
                     <span className="text-sm font-semibold text-vfs-text">Vaccination</span>
                   </div>
-                  {requirements ? (
+                  {!requirements || requirements.vaccination_required === null ? (
+                    <span className="px-2 py-0.5 rounded-full text-xs font-semibold border bg-gray-50 text-gray-500 border-gray-200">
+                      Not specified
+                    </span>
+                  ) : (
                     <span
                       className={`px-2 py-0.5 rounded-full text-xs font-semibold border ${
                         requirements.vaccination_required
@@ -593,10 +643,12 @@ export default function RouteResultsPage() {
                     >
                       {requirements.vaccination_required ? 'Required' : 'Not Required'}
                     </span>
-                  ) : NA}
+                  )}
                 </div>
                 <p className="text-xs text-gray-500">
-                  {requirements?.vaccination_notes ? requirements.vaccination_notes : 'No vaccination requirements noted.'}
+                  {requirements?.vaccination_notes
+                    ? requirements.vaccination_notes
+                    : 'Not published by VFS for this route.'}
                 </p>
               </div>
             </div>

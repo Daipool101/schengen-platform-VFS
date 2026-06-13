@@ -49,9 +49,12 @@ export class VfsContentfulService {
     // VFS locale format: "deu > ind > en"  (destination > origin > language)
     const locale = `${dest3} > ${orig3} > en`;
 
+    // Use [match] (contains) rather than exact equality: VFS locale strings vary
+    // by origin (some carry a trailing city/language suffix), so an exact match
+    // misses valid routes. [match] keeps it origin-agnostic.
     const [locations, pages] = await Promise.all([
       this.query('countryLocation', { 'fields.title[match]': locale, include: '10' }),
-      this.query('countryPage', { 'fields.locale': locale, include: '4' }),
+      this.query('countryPage', { 'fields.locale[match]': `${dest3} > ${orig3}`, include: '4' }),
     ]);
 
     if (!locations && !pages) return empty;

@@ -7,7 +7,7 @@ import { getVisaExemption, VisaExemptInfo } from './visa-policy';
 const FRESHNESS_THRESHOLD_HOURS = 24;
 
 export interface RouteSearchResult {
-  status: 'found' | 'stale' | 'pending' | 'visa_exempt';
+  status: 'found' | 'stale' | 'pending' | 'visa_exempt' | 'unsupported';
   jobId?: string;
   route?: any;
   requirements?: any;
@@ -76,6 +76,20 @@ export class VisaRoutesService {
           destination: dest,
           last_verified_at: null,
           data_freshness: 'unknown',
+        },
+      };
+    }
+
+    // Route was crawled but VFS publishes no data for it → not supported (Phase 2).
+    // Return immediately instead of re-crawling on every search.
+    if (route.route_status === 'unsupported') {
+      return {
+        status: 'unsupported',
+        meta: {
+          origin: orig,
+          destination: dest,
+          last_verified_at: route.updated_at ?? null,
+          data_freshness: 'unsupported',
         },
       };
     }

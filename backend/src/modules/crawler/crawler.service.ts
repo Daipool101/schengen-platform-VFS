@@ -12,11 +12,6 @@ import {
   CrawlJobData,
   CrawlJobPriority,
 } from './crawler.queue';
-import {
-  SCHENGEN_STANDARD_REQUIREMENTS,
-  SCHENGEN_STANDARD_DOCUMENTS,
-  isSchengenCountry,
-} from './schengen-standard-data';
 import { VfsContentfulService, VfsRouteData } from '../vfs/vfs-contentful.service';
 import { VfsVisaTypeService, VfsVisaType } from '../vfs/vfs-visatype.service';
 import { VfsOnePagerService } from '../vfs/vfs-onepager.service';
@@ -182,16 +177,15 @@ export class CrawlerService {
         );
       }
 
+      // Tracks whether VFS published ANY real data for this route. If nothing
+      // is found, the route is marked "unsupported" (Phase 2 territory) — we
+      // never fabricate a fallback baseline.
+      let gotVfsData = false;
+
       if (vfsData?.found) {
         await this.persistVfsData(resolvedRouteId, orig, dest, vfsData);
+        gotVfsData = true;
         this.logger.log(`✅ Persisted REAL VFS data for ${orig}->${dest}`);
-      } else if (isSchengenCountry(dest)) {
-        // ── FALLBACK: VFS returned nothing → use Schengen standard checklist ──
-        // (covers the page so it isn't empty; clearly the EU-standard baseline)
-        await this.seedSchengenStandardData(resolvedRouteId, orig, dest);
-        this.logger.log(`VFS empty — seeded Schengen standard fallback for ${orig}->${dest}`);
-      } else {
-        this.logger.warn(`No VFS data and non-Schengen route ${orig}->${dest} — nothing to persist`);
       }
 
       // ── Per-visa-type data (fees, service charge, checklist PDFs) ──
@@ -211,32 +205,37 @@ export class CrawlerService {
         const visaTypes = this.mergeVisaTypeSources(onePagerTypes, contentfulTypes);
         if (visaTypes.length > 0) {
           await this.persistVisaTypes(resolvedRouteId, orig, dest, visaTypes);
+          gotVfsData = true;
           this.logger.log(
             `✅ Persisted ${visaTypes.length} visa types for ${orig}->${dest} ` +
             `(one-pager: ${onePagerTypes.length}, contentful: ${contentfulTypes.length})`,
           );
         } else {
-          // Both sources empty. If we have stored types, keep them untouched.
-          // Either way mark the route stale so the daily cron retries it —
-          // an empty result must never count as a successful fresh crawl.
+          // Both sources empty. If we have stored types, keep them untouched
+          // and mark stale so the daily cron retries it.
           const { data: existing } = await this.supabase
             .from('visa_types')
             .select('id')
             .eq('route_id', resolvedRouteId)
             .limit(1);
-          this.logger.warn(
-            `No visa types from either source for ${orig}->${dest}` +
-            `${existing?.length ? ' — keeping stored data' : ''}; marking stale for retry`,
-          );
-          await this.supabase
-            .from('visa_requirements')
-            .update({ data_freshness_status: 'stale', updated_at: new Date().toISOString() })
-            .eq('route_id', resolvedRouteId);
+          if (existing?.length) {
+            gotVfsData = true;
+            this.logger.warn(`No fresh visa types for ${orig}->${dest} — keeping stored; marking stale`);
+            await this.supabase
+              .from('visa_requirements')
+              .update({ data_freshness_status: 'stale', updated_at: new Date().toISOString() })
+              .eq('route_id', resolvedRouteId);
+          }
         }
       } catch (e) {
         this.logger.warn(
           `Visa-type fetch failed for ${orig}->${dest}: ${e instanceof Error ? e.message : String(e)}`,
         );
+      }
+
+      // ── No VFS data at all → mark the route unsupported (Phase 2) ──
+      if (!gotVfsData) {
+        await this.markRouteUnsupported(resolvedRouteId, orig, dest);
       }
     } finally {
       // Always release the in-flight lock so future searches can re-crawl
@@ -445,21 +444,21 @@ export class CrawlerService {
       extracted = await this.extractionService.extractVisaData(combinedText, origin, destination);
     }
 
-    // 2) Persist requirements (real fee from VFS; Schengen defaults only fill gaps)
-    const schengen = isSchengenCountry(destination);
+    // 2) Persist requirements — STRICTLY what VFS provides. No fabricated
+    //    defaults: any field VFS doesn't publish stays null.
     const reqPayload: Record<string, any> = {
       route_id: routeId,
-      visa_fee: extracted?.visa_fee ?? (schengen ? 90 : null),
-      visa_fee_currency: extracted?.visa_fee_currency ?? (schengen ? 'EUR' : null),
+      visa_fee: extracted?.visa_fee ?? null,
+      visa_fee_currency: extracted?.visa_fee_currency ?? null,
       service_fee: extracted?.service_fee ?? null,
       service_fee_currency: extracted?.service_fee ? 'INR' : null,
-      processing_time_min: extracted?.processing_time_min ?? (schengen ? 15 : null),
-      processing_time_max: extracted?.processing_time_max ?? (schengen ? 45 : null),
-      insurance_required: extracted?.insurance_required ?? (schengen ? true : null),
-      insurance_min_coverage: extracted?.insurance_min_coverage ?? (schengen ? 30000 : null),
-      vaccination_required: extracted?.vaccination_required ?? false,
+      processing_time_min: extracted?.processing_time_min ?? null,
+      processing_time_max: extracted?.processing_time_max ?? null,
+      insurance_required: extracted?.insurance_required ?? null,
+      insurance_min_coverage: extracted?.insurance_min_coverage ?? null,
+      vaccination_required: extracted?.vaccination_required ?? null,
       vaccination_notes: extracted?.vaccination_notes ?? null,
-      min_passport_validity_days: extracted?.min_passport_validity_days ?? (schengen ? 90 : null),
+      min_passport_validity_days: extracted?.min_passport_validity_days ?? null,
       eligibility_notes: extracted?.eligibility_notes ?? null,
       last_verified_at: now,
       data_freshness_status: 'fresh',
@@ -479,9 +478,8 @@ export class CrawlerService {
       await this.supabase.from('visa_requirements').insert(reqPayload);
     }
 
-    // 3) Documents: real VFS docs (labelled [VFS]) + standard Schengen
-    //    checklist (labelled [STD]) for anything VFS doesn't cover. The
-    //    [VFS]/[STD] prefix lets the frontend show a clear source badge.
+    // 3) Documents: ONLY the real VFS docs (labelled [VFS]). No standard fallback
+    //    checklist — if VFS doesn't publish a document list, we show none.
     const vfsDocs = (extracted?.documents ?? []).map((doc, idx) => ({
       route_id: routeId,
       document_name: doc.name,
@@ -490,31 +488,9 @@ export class CrawlerService {
       display_order: idx,
     }));
 
-    // Keywords already covered by VFS docs (so we don't duplicate them)
-    const covered = vfsDocs.map((d) => d.document_name.toLowerCase());
-    const isCovered = (name: string) => {
-      const n = name.toLowerCase();
-      const key = n.split(' ')[0];
-      return covered.some((c) => c.includes(key) || n.includes(c.split(' ')[0]));
-    };
-
-    let stdDocs: any[] = [];
-    if (isSchengenCountry(destination)) {
-      stdDocs = SCHENGEN_STANDARD_DOCUMENTS.filter((doc) => !isCovered(doc.name)).map(
-        (doc, i) => ({
-          route_id: routeId,
-          document_name: doc.name,
-          is_mandatory: doc.mandatory,
-          notes: `[STD] ${doc.notes ?? ''}`.trim(),
-          display_order: vfsDocs.length + i,
-        }),
-      );
-    }
-
-    const allDocs = [...vfsDocs, ...stdDocs];
-    if (allDocs.length > 0) {
+    if (vfsDocs.length > 0) {
       await this.supabase.from('visa_documents').delete().eq('route_id', routeId);
-      await this.supabase.from('visa_documents').insert(allDocs);
+      await this.supabase.from('visa_documents').insert(vfsDocs);
     }
 
     // 4) Replace VAC centres with the REAL ones from VFS Contentful
@@ -541,92 +517,52 @@ export class CrawlerService {
       );
     }
 
-    // 5) Mark route active
+    // 5) Mark route active + VFS-managed. The visa_category is derived from the
+    //    actual visa types VFS publishes (set in persistVisaTypes), not hardcoded.
     await this.supabase
       .from('visa_routes')
       .update({
         route_status: 'active',
         application_center: 'VFS Global',
-        visa_category: isSchengenCountry(destination)
-          ? 'Schengen Short Stay (Type C)'
-          : 'Short Stay',
         updated_at: now,
       })
       .eq('id', routeId);
   }
 
   /**
-   * Seeds the standardized Schengen short-stay visa data (fees, insurance,
-   * processing time, and the full document checklist) for a route.
-   * Used as the reliable baseline since VFS Global's SPA does not expose
-   * this data in scrapable HTML.
+   * Marks a route as unsupported when VFS publishes no data for it. We never
+   * fabricate a fallback baseline — if VFS doesn't cover the route, the page
+   * says so (Phase 2 will handle embassy/government redirects). If the route
+   * already has stored data from a previous crawl, we keep it and just mark it
+   * stale for retry rather than downgrading to "unsupported".
    */
-  private async seedSchengenStandardData(
+  private async markRouteUnsupported(
     routeId: string,
     origin: string,
     destination: string,
   ): Promise<void> {
     const now = new Date().toISOString();
-    const std = SCHENGEN_STANDARD_REQUIREMENTS;
 
-    // Only seed requirements if none exist yet (don't overwrite richer VFS data)
-    const { data: existingReq } = await this.supabase
-      .from('visa_requirements')
-      .select('id')
-      .eq('route_id', routeId)
-      .maybeSingle();
+    const [{ data: existingReq }, { data: existingTypes }] = await Promise.all([
+      this.supabase.from('visa_requirements').select('id').eq('route_id', routeId).maybeSingle(),
+      this.supabase.from('visa_types').select('id').eq('route_id', routeId).limit(1),
+    ]);
 
-    if (!existingReq) {
-      await this.supabase.from('visa_requirements').insert({
-        route_id: routeId,
-        visa_fee: std.visa_fee,
-        visa_fee_currency: std.visa_fee_currency,
-        service_fee: null, // service fee comes only from real VFS data — never hardcoded
-        service_fee_currency: null,
-        processing_time_min: std.processing_time_min,
-        processing_time_max: std.processing_time_max,
-        insurance_required: std.insurance_required,
-        insurance_min_coverage: std.insurance_min_coverage,
-        vaccination_required: std.vaccination_required,
-        vaccination_notes: std.vaccination_notes,
-        min_passport_validity_days: std.min_passport_validity_days,
-        eligibility_notes: std.eligibility_notes,
-        last_verified_at: now,
-        data_freshness_status: 'fresh',
-        confidence_level: 'medium', // EU-standard baseline, not route-specific VFS data
-        updated_at: now,
-      });
+    if (existingReq || (existingTypes && existingTypes.length > 0)) {
+      // Prior data exists — don't downgrade; mark stale so the cron retries.
+      await this.supabase
+        .from('visa_requirements')
+        .update({ data_freshness_status: 'stale', updated_at: now })
+        .eq('route_id', routeId);
+      this.logger.warn(`No fresh VFS data for ${origin}->${destination} — kept stored data, marked stale`);
+      return;
     }
 
-    // Seed standard document checklist if no documents exist yet
-    const { data: existingDocs } = await this.supabase
-      .from('visa_documents')
-      .select('id')
-      .eq('route_id', routeId)
-      .limit(1);
-
-    if (!existingDocs || existingDocs.length === 0) {
-      await this.supabase.from('visa_documents').insert(
-        SCHENGEN_STANDARD_DOCUMENTS.map((doc, idx) => ({
-          route_id: routeId,
-          document_name: doc.name,
-          is_mandatory: doc.mandatory,
-          notes: `[STD] ${doc.notes ?? ''}`.trim(),
-          display_order: idx,
-        })),
-      );
-    }
-
-    // Mark route active
     await this.supabase
       .from('visa_routes')
-      .update({
-        route_status: 'active',
-        application_center: 'VFS Global',
-        visa_category: 'Schengen Short Stay (Type C)',
-        updated_at: now,
-      })
+      .update({ route_status: 'unsupported', application_center: null, updated_at: now })
       .eq('id', routeId);
+    this.logger.log(`No VFS data for ${origin}->${destination} — marked route unsupported (Phase 2)`);
   }
 
   // ─── URL Strategy ────────────────────────────────────────────────────────────
@@ -844,13 +780,12 @@ export class CrawlerService {
     destination: string,
   ): Promise<void> {
     const now = new Date().toISOString();
-    const isSchengen = isSchengenCountry(destination);
 
     // Helper: pick the crawled value only if it's meaningful, else keep existing
     const merge = <T>(crawled: T | null | undefined, existing: T | null | undefined): T | null =>
       crawled !== null && crawled !== undefined ? crawled : (existing ?? null);
 
-    // ── Merge requirements (NEVER overwrite good data with nulls) ──
+    // ── Merge requirements (NEVER overwrite good data with nulls; no fabricated defaults) ──
     const { data: existingReq } = await this.supabase
       .from('visa_requirements')
       .select('*')
@@ -859,20 +794,19 @@ export class CrawlerService {
 
     const reqPayload = {
       route_id: routeId,
-      visa_fee: merge(data.visa_fee, existingReq?.visa_fee) ?? (isSchengen ? 90 : null),
-      visa_fee_currency: merge(data.visa_fee_currency, existingReq?.visa_fee_currency) ?? (isSchengen ? 'EUR' : null),
+      visa_fee: merge(data.visa_fee, existingReq?.visa_fee),
+      visa_fee_currency: merge(data.visa_fee_currency, existingReq?.visa_fee_currency),
       service_fee: merge(data.service_fee, existingReq?.service_fee),
-      processing_time_min: merge(data.processing_time_min, existingReq?.processing_time_min) ?? (isSchengen ? 15 : null),
-      processing_time_max: merge(data.processing_time_max, existingReq?.processing_time_max) ?? (isSchengen ? 45 : null),
-      insurance_required: merge(data.insurance_required, existingReq?.insurance_required) ?? (isSchengen ? true : null),
-      insurance_min_coverage: merge(data.insurance_min_coverage, existingReq?.insurance_min_coverage) ?? (isSchengen ? 30000 : null),
-      vaccination_required: merge(data.vaccination_required, existingReq?.vaccination_required) ?? false,
+      processing_time_min: merge(data.processing_time_min, existingReq?.processing_time_min),
+      processing_time_max: merge(data.processing_time_max, existingReq?.processing_time_max),
+      insurance_required: merge(data.insurance_required, existingReq?.insurance_required),
+      insurance_min_coverage: merge(data.insurance_min_coverage, existingReq?.insurance_min_coverage),
+      vaccination_required: merge(data.vaccination_required, existingReq?.vaccination_required),
       vaccination_notes: merge(data.vaccination_notes, existingReq?.vaccination_notes),
-      min_passport_validity_days: merge(data.min_passport_validity_days, existingReq?.min_passport_validity_days) ?? (isSchengen ? 90 : null),
+      min_passport_validity_days: merge(data.min_passport_validity_days, existingReq?.min_passport_validity_days),
       eligibility_notes: merge(data.eligibility_notes, existingReq?.eligibility_notes),
       last_verified_at: now,
       data_freshness_status: 'fresh',
-      // Keep the higher confidence (seeded Schengen data is 'high')
       confidence_level: existingReq?.confidence_level === 'high'
         ? 'high'
         : (data.source_confidence ?? existingReq?.confidence_level ?? 'medium'),

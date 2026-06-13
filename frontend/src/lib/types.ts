@@ -91,7 +91,7 @@ export interface VisaType {
 }
 
 export interface RouteSearchResult {
-  status?: 'found' | 'stale' | 'pending' | 'visa_exempt';
+  status?: 'found' | 'stale' | 'pending' | 'visa_exempt' | 'unsupported';
   visa_types?: VisaType[];
   route: {
     origin_country: string;
