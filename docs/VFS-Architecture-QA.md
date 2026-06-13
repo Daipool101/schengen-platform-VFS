@@ -348,6 +348,29 @@ now, not a glued string — and find + fetch happen together in one call.
 
 ---
 
+## Q13. Why did India→Italy show "Service Fee N/A" when VFS publishes it?
+
+**Two separate things, only one was a bug:**
+
+1. **Visa fees were fine** — Italy has all 21 visa types with fees (Tourist €90/₹9,630,
+   etc.). The earlier "missing" appearance was a *mid-crawl screenshot* (the page was viewed
+   while a recrawl was still running). The data was complete once the crawl finished.
+
+2. **Service fee was a real parsing bug.** Italy stores it as:
+   `"VFS Service Charge (inclusive of GST –SGST @9% and CGST@9%), of INR 631"`.
+   Our regex expected the amount *immediately* after "service charge" (like Latvia's
+   "service charge of Rs. 2987"). The GST **parenthetical between** the keyword and the
+   amount made the match fail → N/A.
+
+**Fix:** both parsers now allow a **bounded gap** (`service charge … of INR 631`) between the
+keyword and the amount, then take the first currency amount that follows. Verified: Italy
+→ ₹631, Latvia → ₹2,987 (unchanged), Poland/Netherlands/Sweden all still parse.
+
+**Note — it was NOT "a different page".** Everything for Italy was in the `onePager` we
+already fetch; the only issue was the *text format* of the service-charge sentence.
+
+---
+
 ## Reference: the per-route data flow
 
 ```
