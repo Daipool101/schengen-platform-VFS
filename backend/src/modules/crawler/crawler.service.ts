@@ -352,67 +352,78 @@ export class CrawlerService {
       await this.supabase.from('visa_requirements').update(reqUpdate).eq('route_id', routeId);
     }
 
-    // Clear previous visa types for this route (cascades to fees/docs)
-    await this.supabase.from('visa_types').delete().eq('route_id', routeId);
+    // ── Atomic-ish replace ───────────────────────────────────────────────────
+    // Build every row up front, then write in as few calls as possible. The old
+    // code deleted all types then re-inserted them ONE BY ONE (~2N+1 DB calls,
+    // ~10s), leaving a long window where the API returned a PARTIAL list — so a
+    // page load mid-crawl showed only the first 1-2 visa types. Batching the
+    // inserts shrinks that window to a few milliseconds.
+    const typeRows = visaTypes.map((vt, i) => ({
+      route_id: routeId,
+      category: vt.category,
+      name: vt.name,
+      overview: vt.overview,
+      processing_time: vt.processing_time,
+      photo_specifications: vt.photo_specifications,
+      application_form_url: vt.application_form_url,
+      service_fee: vt.service_fee,
+      service_fee_currency: vt.service_fee_currency,
+      service_fee_note: vt.service_fee_note,
+      checklist_pdf_url: vt.checklist_pdf_url,
+      checklist_name: vt.checklist_name,
+      source_url: sourceUrl,
+      display_order: i,
+      last_verified_at: now,
+      updated_at: now,
+    }));
 
-    for (let i = 0; i < visaTypes.length; i++) {
-      const vt = visaTypes[i];
-      const { data: inserted, error } = await this.supabase
-        .from('visa_types')
-        .insert({
+    await this.supabase.from('visa_types').delete().eq('route_id', routeId);
+    const { data: insertedTypes, error: insErr } = await this.supabase
+      .from('visa_types')
+      .insert(typeRows)
+      .select('id, display_order');
+
+    if (insErr || !insertedTypes) {
+      this.logger.warn(
+        `Failed to insert visa types for ${origin}->${destination}: ${insErr?.message}`,
+      );
+      return;
+    }
+
+    // Map display_order → new id so each type's fees attach to the right row.
+    const idByOrder = new Map<number, string>();
+    for (const row of insertedTypes) idByOrder.set(row.display_order, row.id);
+
+    // Collect all fee + history rows, then batch-insert each table in ONE call.
+    const feeRows: any[] = [];
+    const historyRows: any[] = [];
+    visaTypes.forEach((vt, i) => {
+      const id = idByOrder.get(i);
+      if (!id || vt.fees.length === 0) return;
+      vt.fees.forEach((f, idx) => {
+        feeRows.push({
+          visa_type_id: id,
+          fee_label: f.label,
+          fee_inr: f.inr,
+          fee_eur: f.eur,
+          display_order: idx,
+        });
+        historyRows.push({
           route_id: routeId,
-          category: vt.category,
-          name: vt.name,
-          overview: vt.overview,
-          processing_time: vt.processing_time,
-          photo_specifications: vt.photo_specifications,
-          application_form_url: vt.application_form_url,
+          visa_type_name: vt.name,
+          fee_label: f.label,
+          fee_inr: f.inr,
+          fee_eur: f.eur,
           service_fee: vt.service_fee,
           service_fee_currency: vt.service_fee_currency,
-          service_fee_note: vt.service_fee_note,
-          checklist_pdf_url: vt.checklist_pdf_url,
-          checklist_name: vt.checklist_name,
           source_url: sourceUrl,
-          display_order: i,
-          last_verified_at: now,
-          updated_at: now,
-        })
-        .select('id')
-        .single();
+          captured_at: now,
+        });
+      });
+    });
 
-      if (error || !inserted) {
-        this.logger.warn(`Failed to insert visa type ${vt.name}: ${error?.message}`);
-        continue;
-      }
-
-      // Fee rows
-      if (vt.fees.length > 0) {
-        await this.supabase.from('visa_type_fees').insert(
-          vt.fees.map((f, idx) => ({
-            visa_type_id: inserted.id,
-            fee_label: f.label,
-            fee_inr: f.inr,
-            fee_eur: f.eur,
-            display_order: idx,
-          })),
-        );
-
-        // Snapshot into fee history (versioning)
-        await this.supabase.from('visa_fee_history').insert(
-          vt.fees.map((f) => ({
-            route_id: routeId,
-            visa_type_name: vt.name,
-            fee_label: f.label,
-            fee_inr: f.inr,
-            fee_eur: f.eur,
-            service_fee: vt.service_fee,
-            service_fee_currency: vt.service_fee_currency,
-            source_url: sourceUrl,
-            captured_at: now,
-          })),
-        );
-      }
-    }
+    if (feeRows.length > 0) await this.supabase.from('visa_type_fees').insert(feeRows);
+    if (historyRows.length > 0) await this.supabase.from('visa_fee_history').insert(historyRows);
   }
 
   /**
