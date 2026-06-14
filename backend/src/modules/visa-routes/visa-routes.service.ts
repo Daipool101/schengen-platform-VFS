@@ -94,6 +94,23 @@ export class VisaRoutesService {
       };
     }
 
+    // While a crawl is actively running for this route, keep the client polling
+    // until it finishes. Otherwise the page renders half-populated: persistVfsData
+    // writes `requirements` first, then the visa-types step (fees, service charge,
+    // processing time) completes seconds later — so a mid-crawl read shows those
+    // fields blank until a manual refresh.
+    if (this.crawlerService.isCrawlInFlight(orig, dest)) {
+      return {
+        status: 'pending',
+        meta: {
+          origin: orig,
+          destination: dest,
+          last_verified_at: null,
+          data_freshness: 'pending',
+        },
+      };
+    }
+
     const details = await this.getRouteWithDetails(route.id, orig, dest);
 
     // Route row exists but has no requirements data yet — it's still being crawled,
