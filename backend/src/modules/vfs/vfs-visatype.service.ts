@@ -200,11 +200,14 @@ export class VfsVisaTypeService {
     // fee table isn't embedded in visaInformation (e.g. Austria) still get fees.
     const feesByName: Record<string, VfsFeeRow[]> = {};
     for (const e of entries) {
-      if (e?.fields?.table && /visa fee/i.test(e.fields.table)) {
-        const nm = this.norm(this.visaTypeFromInternalName(e.fields.internalName || ''));
-        const fees = this.parseHtmlFeeTable(e.fields.table);
-        if (nm && fees.length > 0) feesByName[nm] = fees;
-      }
+      if (!e?.fields?.table) continue;
+      // parseHtmlFeeTable returns [] for non-fee tables (no currency column), so
+      // we no longer need the brittle "visa fee" text gate that skipped valid
+      // tables labelled "Visa Category" etc. (e.g. China routes).
+      const fees = this.parseHtmlFeeTable(e.fields.table);
+      if (fees.length === 0) continue;
+      const nm = this.norm(this.visaTypeFromInternalName(e.fields.internalName || ''));
+      if (nm) feesByName[nm] = fees;
     }
 
     if (vti) {
@@ -217,7 +220,7 @@ export class VfsVisaTypeService {
 
     // ── FALLBACK: derive from fee tables (countries without a dropdown entry) ──
     const feeTables = entries
-      .filter((e) => e?.fields?.table && /visa fee/i.test(e.fields.table))
+      .filter((e) => e?.fields?.table)
       .map((e) => ({
         visaType: this.visaTypeFromInternalName(e.fields.internalName || ''),
         fees: this.parseHtmlFeeTable(e.fields.table),
@@ -354,7 +357,7 @@ export class VfsVisaTypeService {
       if (Array.isArray(n)) { n.forEach(walk); return; }
       if (n.nodeType?.startsWith('embedded-') && n.data?.target?.sys?.id) {
         const e = byId[n.data.target.sys.id];
-        if (e?.fields?.table && /visa fee/i.test(e.fields.table)) { found = e; return; }
+        if (e?.fields?.table && this.parseHtmlFeeTable(e.fields.table).length > 0) { found = e; return; }
       }
       if (n.content) walk(n.content);
     };
@@ -396,48 +399,81 @@ export class VfsVisaTypeService {
     return s.replace(/^Table:\s*/i, '').replace(/\s+/g, ' ').trim();
   }
 
+  /**
+   * Parses a VFS fee table into rows of { label, inr, eur }. Origin-agnostic:
+   * VFS tables differ by origin — simple "Label | EUR | INR" (India) and complex
+   * multi-row, grouped, multi-currency layouts (e.g. China: a "In Euros | In CNY"
+   * pair repeated per nationality group). We capture the canonical EUR fee (present
+   * in every Schengen table) and INR when present; other local currencies (CNY,
+   * RUB…) are recognised for column alignment but not yet stored (EUR-first).
+   *
+   * A table is only treated as a fee table if it has at least one currency column —
+   * that keeps non-fee tables (e.g. "Processing Time") from being mis-parsed.
+   */
   private parseHtmlFeeTable(html: string): VfsFeeRow[] {
-    // Attribute-tolerant cell/row extraction (VFS tables vary: <td> vs <td class="...">)
-    const extractCells = (rowHtml: string): string[] =>
-      [...rowHtml.matchAll(/<t[dh][^>]*>([\s\S]*?)<\/t[dh]>/gi)].map((c) =>
-        c[1]
-          .replace(/<[^>]+>/g, '')
-          .replace(/&#8364;|€/g, '')
-          .replace(/&nbsp;/g, ' ')
-          .replace(/\s+/g, ' ')
-          .trim(),
-      );
+    const strip = (c: string) =>
+      c
+        .replace(/<[^>]+>/g, '')
+        .replace(/&#8364;/g, '€')
+        .replace(/&#8377;/g, '₹')
+        .replace(/&nbsp;/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
 
-    const rowMatches = [...html.matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/gi)];
-    if (rowMatches.length === 0) return [];
+    const rows = [...html.matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/gi)].map((r) =>
+      [...r[1].matchAll(/<t[dh][^>]*>([\s\S]*?)<\/t[dh]>/gi)].map((c) => strip(c[1])),
+    );
+    if (rows.length < 2) return [];
 
-    // Determine INR / EUR / label column indices from the header row
-    // (column order differs by country: Poland = INR,EUR ; Austria = EUR,INR)
-    const header = extractCells(rowMatches[0][1]);
-    let inrIdx = header.findIndex((h) => /inr|rupee|₹/i.test(h));
-    let eurIdx = header.findIndex((h) => /eur|euro|€/i.test(h));
-    if (inrIdx === -1 && eurIdx === -1) {
-      // No recognizable header → assume label, INR, EUR
-      inrIdx = 1;
-      eurIdx = 2;
-    } else {
-      if (inrIdx === -1) inrIdx = eurIdx === 1 ? 2 : 1;
-      if (eurIdx === -1) eurIdx = inrIdx === 1 ? 2 : 1;
+    // Map a header cell to a currency-column tag. EUR/INR are captured; any other
+    // recognised currency becomes 'OTHER' so column positions stay aligned with
+    // the data row's numeric cells.
+    const OTHER_CUR =
+      /\bcny\b|yuan|\brmb\b|\brub\b|rouble|ruble|\busd\b|dollar|\$|\baed\b|dirham|krona|\bsek\b|\bnok\b|\bdkk\b|\bchf\b|franc|zloty|\bpln\b|forint|\bhuf\b|koruna|\bczk\b|\blev\b|\bbgn\b|\bron\b|\bgbp\b|pound|\bjpy\b|yen|baht|\bthb\b|ringgit|\bmyr\b|peso|\bphp\b|local currency/i;
+    const toCur = (s: string): 'EUR' | 'INR' | 'OTHER' | null => {
+      if (/euro|€|\beur\b/i.test(s)) return 'EUR';
+      if (/inr|rupee|₹|indian/i.test(s)) return 'INR';
+      if (OTHER_CUR.test(s)) return 'OTHER';
+      return null;
+    };
+    const numOf = (s: string): number | null => {
+      if (!/\d/.test(s)) return null;
+      const cleaned = s.replace(/[^\d.]/g, '');
+      const n = parseFloat(cleaned);
+      return cleaned && !isNaN(n) ? n : null;
+    };
+    const isNumericCell = (s: string) => /^[^a-zA-Z]*\d[\d,.\s/-]*$/.test(s) && numOf(s) !== null;
+
+    // Header rows precede the first row that contains a numeric (amount) cell.
+    const firstDataIdx = rows.findIndex((cells) => cells.some(isNumericCell));
+    if (firstDataIdx === -1) return [];
+
+    // Pick the header row with the most currency columns; its currency cells (in
+    // order, label cells dropped) define the currency sequence per data column.
+    let currencySeq: ('EUR' | 'INR' | 'OTHER')[] = [];
+    for (const hr of rows.slice(0, firstDataIdx + 1)) {
+      const seq = hr.map(toCur).filter((c): c is 'EUR' | 'INR' | 'OTHER' => c !== null);
+      if (seq.length > currencySeq.length) currencySeq = seq;
     }
-    const labelIdx = [0, 1, 2].find((i) => i !== inrIdx && i !== eurIdx) ?? 0;
+    if (currencySeq.length === 0) return []; // no currency column → not a fee table
 
-    const rows: VfsFeeRow[] = [];
-    for (let r = 1; r < rowMatches.length; r++) {
-      const cells = extractCells(rowMatches[r][1]);
-      if (cells.length < 2) continue;
-      const label = cells[labelIdx];
-      const inr = this.toNumber(cells[inrIdx]);
-      const eur = this.toNumber(cells[eurIdx]);
-      if (label && (inr !== null || eur !== null)) {
-        rows.push({ label, inr, eur });
+    const out: VfsFeeRow[] = [];
+    for (let r = firstDataIdx; r < rows.length; r++) {
+      const cells = rows[r];
+      const label = cells.find((c) => c && !isNumericCell(c)) ?? '';
+      const amounts = cells.filter(isNumericCell).map(numOf);
+      if (!label || amounts.length === 0) continue;
+
+      // Pair the Nth amount with the Nth currency; take the first EUR / first INR.
+      let inr: number | null = null;
+      let eur: number | null = null;
+      for (let i = 0; i < amounts.length && i < currencySeq.length; i++) {
+        if (currencySeq[i] === 'EUR' && eur === null) eur = amounts[i];
+        if (currencySeq[i] === 'INR' && inr === null) inr = amounts[i];
       }
+      if (inr !== null || eur !== null) out.push({ label, inr, eur });
     }
-    return rows;
+    return out;
   }
 
   private parseServiceCharge(
