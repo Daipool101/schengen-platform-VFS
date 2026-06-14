@@ -200,12 +200,12 @@ export class VfsVisaTypeService {
     // fee table isn't embedded in visaInformation (e.g. Austria) still get fees.
     // Names of the dropdown visa types (normalized) — used to recognise a
     // "combined" fee table whose ROWS are themselves visa types.
-    const typeNames = new Set<string>();
+    const typeNames: string[] = [];
     if (vti) {
       for (const link of vti.fields.visaTypes) {
         const e = byId[link?.sys?.id];
         const nm = this.norm(e?.fields?.visaType ?? '');
-        if (nm) typeNames.add(nm);
+        if (nm) typeNames.push(nm);
       }
     }
 
@@ -219,17 +219,16 @@ export class VfsVisaTypeService {
     // no longer need the brittle "visa fee" text gate that skipped valid tables
     // labelled "Visa Category" (e.g. China routes).
     const feesByName: Record<string, VfsFeeRow[]> = {};
-    const feesByRowLabel: Record<string, VfsFeeRow[]> = {};
+    const combinedRows: { key: string; row: VfsFeeRow }[] = [];
     for (const e of entries) {
       if (!e?.fields?.table) continue;
       const fees = this.parseHtmlFeeTable(e.fields.table);
       if (fees.length === 0) continue;
-      const rowsThatAreTypes = fees.filter((f) => typeNames.has(this.norm(f.label)));
-      if (rowsThatAreTypes.length >= 2) {
-        for (const row of fees) {
-          const k = this.norm(row.label);
-          if (k) (feesByRowLabel[k] ??= []).push(row);
-        }
+      const typeRows = fees.filter((f) =>
+        typeNames.some((tn) => this.fuzzyNameMatch(this.norm(f.label), tn)),
+      );
+      if (typeRows.length >= 2) {
+        for (const row of fees) combinedRows.push({ key: this.norm(row.label), row });
       } else {
         const nm = this.norm(this.visaTypeFromInternalName(e.fields.internalName || ''));
         if (nm) feesByName[nm] = fees;
@@ -237,7 +236,7 @@ export class VfsVisaTypeService {
     }
 
     if (vti) {
-      const result = this.parseFromDropdown(vti, byId, assetById, pdfs, applicationForm, serviceCharge, feesByName, feesByRowLabel);
+      const result = this.parseFromDropdown(vti, byId, assetById, pdfs, applicationForm, serviceCharge, feesByName, combinedRows);
       if (result.length > 0) {
         this.logger.log(`Parsed ${result.length} visa types from dropdown`);
         return result;
@@ -288,7 +287,7 @@ export class VfsVisaTypeService {
     applicationForm: { title: string; url: string | null } | undefined,
     serviceCharge: { amount: number; currency: string; note: string } | null,
     feesByName: Record<string, VfsFeeRow[]> = {},
-    feesByRowLabel: Record<string, VfsFeeRow[]> = {},
+    combinedRows: { key: string; row: VfsFeeRow }[] = [],
   ): VfsVisaType[] {
     const out: VfsVisaType[] = [];
     let category = 'Schengen Visa';
@@ -308,10 +307,14 @@ export class VfsVisaTypeService {
       const info = entry.fields?.visaInformation;
       const tableEntry = this.findEmbeddedTable(info, byId);
       let fees = tableEntry ? this.parseHtmlFeeTable(tableEntry.fields.table) : [];
-      // Fallback chain: a fee table named after this type, then a matching row
+      // Fallback chain: a fee table named after this type, then matching rows
       // from a combined table (so every type in a combined table gets its fee).
+      if (fees.length === 0) fees = feesByName[this.norm(name)] ?? [];
       if (fees.length === 0) {
-        fees = feesByName[this.norm(name)] ?? feesByRowLabel[this.norm(name)] ?? [];
+        const matched = combinedRows
+          .filter((cr) => this.fuzzyNameMatch(cr.key, this.norm(name)))
+          .map((cr) => cr.row);
+        if (matched.length) fees = matched;
       }
       const appUrl = this.findEformsLink(info) ?? applicationForm?.url ?? null;
       const processingTime = this.extractSectionText(info, byId, /processing time/i);
@@ -618,5 +621,25 @@ export class VfsVisaTypeService {
 
   private norm(s: string): string {
     return s.toLowerCase().replace(/[^a-z0-9 ]/g, '').replace(/\s+/g, ' ').trim();
+  }
+
+  /**
+   * Fuzzy match between two already-normalized visa-type / fee-row labels, so a
+   * dropdown type like "business conference" picks up a combined-table row
+   * "business", and "visiting family friends" matches "visit family and friends".
+   * Tolerant of word variants (visit/visiting, tourism/tourist) via 4-char prefix.
+   */
+  private fuzzyNameMatch(a: string, b: string): boolean {
+    if (!a || !b) return false;
+    if (a === b || a.includes(b) || b.includes(a)) return true;
+    const stop = new Set(['and', 'or', 'the', 'for', 'visa', 'of', 'to']);
+    const tok = (s: string) => s.split(' ').filter((t) => t.length >= 3 && !stop.has(t));
+    const ta = tok(a);
+    const tb = tok(b);
+    if (!ta.length || !tb.length) return false;
+    const shares = (x: string, y: string) =>
+      x === y || x.startsWith(y.slice(0, 4)) || y.startsWith(x.slice(0, 4));
+    const shared = ta.filter((x) => tb.some((y) => shares(x, y))).length;
+    return shared >= Math.ceil(Math.min(ta.length, tb.length) * 0.5);
   }
 }
