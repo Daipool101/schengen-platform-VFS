@@ -198,20 +198,46 @@ export class VfsVisaTypeService {
     );
     // Build a name→fees map from ALL fee-table entries, so dropdown types whose
     // fee table isn't embedded in visaInformation (e.g. Austria) still get fees.
+    // Names of the dropdown visa types (normalized) — used to recognise a
+    // "combined" fee table whose ROWS are themselves visa types.
+    const typeNames = new Set<string>();
+    if (vti) {
+      for (const link of vti.fields.visaTypes) {
+        const e = byId[link?.sys?.id];
+        const nm = this.norm(e?.fields?.visaType ?? '');
+        if (nm) typeNames.add(nm);
+      }
+    }
+
+    // Two fee maps:
+    //  - feesByName: single-type tables (rows are fee variants: adult/child) keyed
+    //    by the table's visa-type name.
+    //  - feesByRowLabel: rows of COMBINED tables (≥2 rows whose labels are visa
+    //    types, e.g. China's one table listing Tourism/Business/Cultural all at
+    //    €90) distributed per row so every matching type gets its own fee.
+    // parseHtmlFeeTable returns [] for non-fee tables (no currency column), so we
+    // no longer need the brittle "visa fee" text gate that skipped valid tables
+    // labelled "Visa Category" (e.g. China routes).
     const feesByName: Record<string, VfsFeeRow[]> = {};
+    const feesByRowLabel: Record<string, VfsFeeRow[]> = {};
     for (const e of entries) {
       if (!e?.fields?.table) continue;
-      // parseHtmlFeeTable returns [] for non-fee tables (no currency column), so
-      // we no longer need the brittle "visa fee" text gate that skipped valid
-      // tables labelled "Visa Category" etc. (e.g. China routes).
       const fees = this.parseHtmlFeeTable(e.fields.table);
       if (fees.length === 0) continue;
-      const nm = this.norm(this.visaTypeFromInternalName(e.fields.internalName || ''));
-      if (nm) feesByName[nm] = fees;
+      const rowsThatAreTypes = fees.filter((f) => typeNames.has(this.norm(f.label)));
+      if (rowsThatAreTypes.length >= 2) {
+        for (const row of fees) {
+          const k = this.norm(row.label);
+          if (k) (feesByRowLabel[k] ??= []).push(row);
+        }
+      } else {
+        const nm = this.norm(this.visaTypeFromInternalName(e.fields.internalName || ''));
+        if (nm) feesByName[nm] = fees;
+      }
     }
 
     if (vti) {
-      const result = this.parseFromDropdown(vti, byId, assetById, pdfs, applicationForm, serviceCharge, feesByName);
+      const result = this.parseFromDropdown(vti, byId, assetById, pdfs, applicationForm, serviceCharge, feesByName, feesByRowLabel);
       if (result.length > 0) {
         this.logger.log(`Parsed ${result.length} visa types from dropdown`);
         return result;
@@ -262,6 +288,7 @@ export class VfsVisaTypeService {
     applicationForm: { title: string; url: string | null } | undefined,
     serviceCharge: { amount: number; currency: string; note: string } | null,
     feesByName: Record<string, VfsFeeRow[]> = {},
+    feesByRowLabel: Record<string, VfsFeeRow[]> = {},
   ): VfsVisaType[] {
     const out: VfsVisaType[] = [];
     let category = 'Schengen Visa';
@@ -281,8 +308,11 @@ export class VfsVisaTypeService {
       const info = entry.fields?.visaInformation;
       const tableEntry = this.findEmbeddedTable(info, byId);
       let fees = tableEntry ? this.parseHtmlFeeTable(tableEntry.fields.table) : [];
-      // Fallback: match a fee table by visa-type name (countries that don't embed it)
-      if (fees.length === 0) fees = feesByName[this.norm(name)] ?? [];
+      // Fallback chain: a fee table named after this type, then a matching row
+      // from a combined table (so every type in a combined table gets its fee).
+      if (fees.length === 0) {
+        fees = feesByName[this.norm(name)] ?? feesByRowLabel[this.norm(name)] ?? [];
+      }
       const appUrl = this.findEformsLink(info) ?? applicationForm?.url ?? null;
       const processingTime = this.extractSectionText(info, byId, /processing time/i);
       const checklist = this.matchChecklist(name, pdfs);
