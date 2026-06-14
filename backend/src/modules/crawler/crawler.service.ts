@@ -331,24 +331,7 @@ export class CrawlerService {
     const svc = visaTypes.find((v) => v.service_fee != null);
     // Real processing time text from VFS (e.g. Business Visit) → Visa Overview
     const ptText = visaTypes.find((v) => v.processing_time)?.processing_time ?? null;
-    // Representative visa fee for the Visa Overview = most common EUR amount across
-    // all types (the standard adult fee), so the Overview isn't N/A when per-type
-    // fees exist. EUR is the canonical Schengen fee present for every origin.
-    const eurFees = visaTypes
-      .flatMap((v) => v.fees.map((f) => f.eur))
-      .filter((n): n is number => n != null);
-    const modeEur =
-      eurFees.length > 0
-        ? eurFees.slice().sort(
-            (a, b) =>
-              eurFees.filter((x) => x === b).length - eurFees.filter((x) => x === a).length,
-          )[0]
-        : null;
     const reqUpdate: Record<string, any> = { updated_at: now };
-    if (modeEur != null) {
-      reqUpdate.visa_fee = modeEur;
-      reqUpdate.visa_fee_currency = 'EUR';
-    }
     if (svc) {
       reqUpdate.service_fee = svc.service_fee;
       reqUpdate.service_fee_currency = svc.service_fee_currency;
@@ -364,7 +347,7 @@ export class CrawlerService {
       }
       reqUpdate.processing_time_notes = ptText.slice(0, 500);
     }
-    if (svc || ptText || modeEur != null) {
+    if (svc || ptText) {
       await this.supabase.from('visa_requirements').update(reqUpdate).eq('route_id', routeId);
     }
 
